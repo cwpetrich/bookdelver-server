@@ -1,0 +1,60 @@
+# The Bookdelver server behind Caddy, which gets and renews its HTTPS
+# certificate by itself (this folder's README, "A VPS"). Set your name in
+# BOOKDELVER_URL and in the Caddyfile, then `docker compose up -d`.
+#
+# For a home machine, leave Caddy out and use one of the tunnels below
+# instead (the README, "A home PC or Pi").
+services:
+  bookdelver:
+    image: ghcr.io/cwpetrich/bookdelver-server:latest
+    # Or built here, from this folder: `build: .` in place of `image:`.
+    restart: unless-stopped
+    environment:
+      BOOKDELVER_URL: wss://tables.example.net
+      # BOOKDELVER_NAME: The Lantern Table
+      # BOOKDELVER_JOIN: invite
+    volumes:
+      - bookdelver-data:/data
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - bookdelver
+
+  # A Cloudflare Tunnel instead of Caddy: a public name on your own domain, no
+  # port opened at home. Make the tunnel in Cloudflare's dashboard, route its
+  # name to http://bookdelver:8787, and put its token here.
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run
+  #   environment:
+  #     TUNNEL_TOKEN: your-tunnel-token
+  #   depends_on:
+  #     - bookdelver
+
+  # Tailscale Funnel instead: https://<machine>.<tailnet>.ts.net, no domain
+  # needed. Make an auth key in Tailscale's admin console.
+  # tailscale:
+  #   image: tailscale/tailscale:latest
+  #   restart: unless-stopped
+  #   hostname: bookdelver
+  #   environment:
+  #     TS_AUTHKEY: your-auth-key
+  #     TS_SERVE_CONFIG: /config/serve.json
+  #     TS_STATE_DIR: /var/lib/tailscale
+  #   volumes:
+  #     - ./tailscale:/config
+  #     - tailscale-state:/var/lib/tailscale
+
+volumes:
+  bookdelver-data:
+  caddy-data:
+  # tailscale-state:

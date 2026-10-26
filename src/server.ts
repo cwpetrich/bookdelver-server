@@ -1,0 +1,544 @@
+import { type IncomingMessage, type ServerResponse, createServer as createHttp } from 'node:http'
+import { createServer as createHttps } from 'node:https'
+import type { AddressInfo } from 'node:net'
+import { Relay, type Send } from './shared/relay.ts'
+import {
+  LOCKSTEP_PROTOCOL,
+  type RefuseReason,
+  WIRE_LIMITS,
+  isRoomCode,
+  wireText,
+} from './shared/relay-wire.ts'
+import {
+  type FromServer,
+  type JoinPolicy,
+  type Member,
+  type MemberRole,
+  SERVER_PROTOCOL,
+  SESSION_LIMITS,
+  type SessionRefuse,
+  type TableListing,
+  encodeInvite,
+  isSession,
+  readToServer,
+} from './shared/session-wire.ts'
+import {
+  DataFolder,
+  type ServerFile,
+  type StoredInvite,
+  type StoredMember,
+  SERVER_FORMAT,
+  SERVER_VERSION,
+  hashSecret,
+  newCode,
+  newSecret,
+} from './store.ts'
+import { type WebSocket, WebSocketServer } from 'ws'
+
+/**
+ * The reference server (docs/proposals/self-hosted-servers.md, slice SH1;
+ * docs/server-protocol.md): one Node program a player runs for their group.
+ * It puts each table's inputs in order and passes them on, and never runs a
+ * fight: its rooms are core's `Relay`, which reads envelopes only. It knows
+ * its members by a secret each phone made for it alone (kept as a hash),
+ * hands out room codes, lists its tables, keeps each open room's log on disk,
+ * closes a room after a day idle, and holds rate limits.
+ *
+ * Tables only, in SH1: no library (SH3), no host's tools beyond the owner
+ * invite and the `invite` command (SH2).
+ */
+
+export interface ServerOptions {
+  /** 0: any free port. */
+  port: number
+  /** The interface to listen on (`127.0.0.1` for this machine only). Default: every one. */
+  host?: string
+  /** The data folder. */
+  data: string
+  /** The public address that goes into invites; default `ws://localhost:<port>`. */
+  url?: string
+  /** On the first start only: the server's name, notice and join policy. */
+  name?: string
+  notice?: string
+  join?: JoinPolicy
+  /** TLS, when not left to Caddy or a tunnel: the certificate and key, as PEM text. */
+  tls?: { cert: string; key: string }
+  /** The clock (ms), for tests. */
+  now?: () => number
+  /** Where the server's own lines go. Default: none. */
+  log?: (line: string) => void
+  /** The rate limits, for tests that play faster than people (`LIMITS`). */
+  limits?: Partial<Record<'messagesPerSecond' | 'proposalsPerSecond' | 'helloMs', number>>
+}
+
+export interface RunningServer {
+  readonly port: number
+  /** The address in invites. */
+  readonly url: string
+  /** The owner invite's code, until someone has used it. */
+  ownerInvite(): string | undefined
+  /** A new member invite's code: `uses` times, until `hours` from now (none: no end). */
+  invite(role?: MemberRole, uses?: number, hours?: number): string
+  /** Close the room `room` (as 24 hours idle does). */
+  closeRoom(room: string): void
+  /** Rooms idle past the limit closed now (the server does it every minute). */
+  sweep(): void
+  close(): Promise<void>
+}
+
+export const LIMITS = {
+  /** Messages a connection may send in a second before it's closed. */
+  messagesPerSecond: 100,
+  /** Proposals a connection may make in a second before they're refused (`slow`). */
+  proposalsPerSecond: 20,
+  /** A room with nothing happening for this long is closed. */
+  idleMs: 24 * 60 * 60 * 1000,
+  /** Rooms at once, and members kept. */
+  rooms: 200,
+  members: 1_000,
+  /**
+   * A message's bytes on the wire (`ws`'s `maxPayload`): the protocol's cap
+   * of 1,000,000 characters at UTF-8's 4 bytes a character at most; the
+   * characters are counted once it's read.
+   */
+  frameBytes: WIRE_LIMITS.message * 4,
+  /** How long a new connection has to say `hello`. */
+  helloMs: 10_000,
+  /** A ping this often; no answer by the next, and the connection is gone. */
+  pingMs: 30_000,
+} as const
+
+interface Room {
+  relay: Relay
+  title: string
+  active: number
+  /** Whether its start is on disk (it has opened). */
+  kept: boolean
+}
+
+interface Connection {
+  id: string
+  ws: WebSocket
+  /** Answered the last ping. */
+  alive: boolean
+  member: StoredMember | undefined
+  rooms: Set<string>
+  messages: number[]
+  proposals: number[]
+}
+
+/** Start a server: listening once the promise resolves. */
+export async function startServer(opts: ServerOptions): Promise<RunningServer> {
+  const now = opts.now ?? (() => Date.now())
+  const say = opts.log ?? (() => {})
+  const rate = { ...LIMITS, ...opts.limits }
+  const folder = new DataFolder(opts.data)
+  const fresh = (): ServerFile => ({
+    format: SERVER_FORMAT,
+    version: SERVER_VERSION,
+    name: (opts.name ?? 'Bookdelver server').slice(0, SESSION_LIMITS.serverName),
+    notice: (opts.notice ?? '').slice(0, SESSION_LIMITS.notice),
+    join: opts.join ?? 'invite',
+    members: [],
+    invites: [],
+  })
+  // The owner invite on a first start, kept until it's used.
+  folder.update(fresh, (file) => {
+    const owned = file.members.some((m) => m.role === 'owner')
+    if (owned || file.invites.some((i) => i.secret !== undefined)) return
+    const secret = newSecret()
+    file.invites.push({ id: newCode(8), hash: hashSecret(secret), role: 'owner', uses: 1, secret })
+  })
+
+  const rooms = new Map<string, Room>()
+  for (const { start, log } of folder.keptRooms()) {
+    const owners = start.owners.map((o) => o ?? undefined)
+    const relay = Relay.resume(
+      start.room,
+      start.build,
+      { ...(start.setup as object), players: start.players, host: start.host },
+      log,
+      owners,
+    )
+    // The setup as it was sent, not with the fields above laid over it.
+    relay.setup = start.setup
+    rooms.set(start.room, { relay, title: start.title, active: start.active, kept: true })
+  }
+  const conns = new Map<string, Connection>()
+  let nextConn = 1
+
+  const handler = (_req: IncomingMessage, res: ServerResponse) => {
+    res.writeHead(426, { 'content-type': 'text/plain' })
+    res.end('A Bookdelver server: connect from the app.\n')
+  }
+  const http =
+    opts.tls === undefined
+      ? createHttp(handler)
+      : createHttps({ cert: opts.tls.cert, key: opts.tls.key }, handler)
+
+  // WebSockets by `ws`: frames, masking, fragments, control frames and the close handshake
+  // are its; a message past `maxPayload` closes the connection (1009), text that isn't
+  // UTF-8 too (1007). No compression: nothing a phone sends is worth the memory it costs.
+  const wss = new WebSocketServer({
+    server: http,
+    maxPayload: LIMITS.frameBytes,
+    perMessageDeflate: false,
+  })
+  wss.on('connection', (ws) => {
+    const conn: Connection = {
+      id: `c${nextConn++}`,
+      ws,
+      alive: true,
+      member: undefined,
+      rooms: new Set(),
+      messages: [],
+      proposals: [],
+    }
+    conns.set(conn.id, conn)
+    ws.on('message', (data, binary) => {
+      if (binary) {
+        ws.close(1003, 'text only')
+        return
+      }
+      receive(
+        conn,
+        (Array.isArray(data) ? Buffer.concat(data) : Buffer.from(data as Buffer)).toString('utf8'),
+      )
+    })
+    ws.on('pong', () => {
+      conn.alive = true
+    })
+    ws.on('close', () => gone(conn))
+    ws.on('error', () => ws.terminate())
+    // A connection that hasn't said who it is in time is let go.
+    setTimeout(() => {
+      if (conn.member === undefined && conns.has(conn.id)) ws.close(1008, 'no hello')
+    }, rate.helloMs).unref()
+  })
+
+  await new Promise<void>((resolve) => http.listen(opts.port, opts.host, resolve))
+  const port = (http.address() as AddressInfo).port
+  const url = opts.url ?? `ws://localhost:${port}`
+  const sweeper = setInterval(() => sweep(), 60_000)
+  sweeper.unref()
+  // A ping every half minute; a connection that didn't answer the last one is gone.
+  const heartbeat = setInterval(() => {
+    for (const conn of conns.values()) {
+      if (!conn.alive) {
+        conn.ws.terminate()
+        continue
+      }
+      conn.alive = false
+      conn.ws.ping()
+    }
+  }, LIMITS.pingMs)
+  heartbeat.unref()
+
+  function file(): ServerFile {
+    return folder.read(fresh)
+  }
+
+  function sendSession(conn: Connection, message: FromServer) {
+    conn.ws.send(JSON.stringify(message))
+  }
+
+  function refuseSession(conn: Connection, reason: SessionRefuse, want?: number) {
+    sendSession(conn, {
+      sv: SERVER_PROTOCOL,
+      t: 'refuse',
+      reason,
+      ...(want === undefined ? {} : { want }),
+    })
+  }
+
+  function deliver(sends: readonly Send[]) {
+    for (const s of sends) conns.get(s.to)?.ws.send(wireText(s.message))
+  }
+
+  /** A table-layer refusal for a room the relay can't answer for (none, or closed). */
+  function refuseTable(conn: Connection, room: string, build: string, reason: RefuseReason) {
+    conn.ws.send(wireText({ v: LOCKSTEP_PROTOCOL, build, room, t: 'refuse', reason, want: build }))
+  }
+
+  /** `stamps` within the last second, `t` added: how many. */
+  function within(stamps: number[], t: number): number {
+    stamps.push(t)
+    while (stamps.length > 0 && stamps[0]! <= t - 1000) stamps.shift()
+    return stamps.length
+  }
+
+  function receive(conn: Connection, text: string) {
+    const t = now()
+    if (within(conn.messages, t) > rate.messagesPerSecond) {
+      say(`${conn.id}: too many messages, closed`)
+      conn.ws.close(1008, 'too many messages')
+      return
+    }
+    if (text.length > WIRE_LIMITS.message) {
+      conn.ws.close(1009, 'too long')
+      return
+    }
+    let value: unknown
+    try {
+      value = JSON.parse(text)
+    } catch {
+      if (conn.member === undefined) refuseSession(conn, 'garbled')
+      return
+    }
+    if (isSession(value)) return session(conn, value)
+    if (conn.member === undefined) return
+    table(conn, value)
+  }
+
+  function session(conn: Connection, value: unknown) {
+    const sv = (value as { sv?: unknown }).sv
+    if (sv !== SERVER_PROTOCOL) return refuseSession(conn, 'version', SERVER_PROTOCOL)
+    const read = readToServer(value)
+    if (!('ok' in read)) return refuseSession(conn, 'garbled')
+    const m = read.ok
+    if (m.t === 'hello') return hello(conn, m)
+    const member = conn.member
+    if (member === undefined) return
+    switch (m.t) {
+      case 'rename': {
+        const taken = file().members.some(
+          (x) => x.id !== member.id && x.name.toLowerCase() === m.name.toLowerCase(),
+        )
+        if (taken) return refuseSession(conn, 'name')
+        folder.update(fresh, (f) => {
+          const kept = f.members.find((x) => x.id === member.id)
+          if (kept !== undefined) kept.name = m.name
+        })
+        member.name = m.name
+        return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'you', you: shown(member) })
+      }
+      case 'tables':
+        return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'tables', list: listing(member.id) })
+      case 'table': {
+        if (rooms.size >= LIMITS.rooms) return refuseSession(conn, 'full')
+        let code = newCode(6)
+        while (rooms.has(code)) code = newCode(6)
+        rooms.set(code, { relay: new Relay(code), title: 'A table', active: now(), kept: false })
+        say(`${member.name} opened table ${code}`)
+        return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'room', room: code })
+      }
+      case 'leave': {
+        if (m.forget) {
+          folder.update(fresh, (f) => {
+            f.members = f.members.filter((x) => x.id !== member.id)
+          })
+          say(`${member.name} left, and asked to be forgotten`)
+        }
+        conn.ws.close(1000, 'left')
+        return
+      }
+    }
+  }
+
+  function shown(m: StoredMember): Member {
+    return { id: m.id, name: m.name, role: m.role }
+  }
+
+  function hello(
+    conn: Connection,
+    m: { secret: string; invite?: string; name?: string; build: string },
+  ) {
+    if (conn.member !== undefined) return
+    const hash = hashSecret(m.secret)
+    let member = file().members.find((x) => x.secret === hash)
+    if (member === undefined) {
+      const name = m.name
+      if (name === undefined) return refuseSession(conn, 'secret')
+      const made = folder.update(fresh, (f): StoredMember | SessionRefuse => {
+        if (f.members.length >= LIMITS.members) return 'full'
+        if (f.members.some((x) => x.name.toLowerCase() === name.toLowerCase())) return 'name'
+        let invite: StoredInvite | undefined
+        if (m.invite !== undefined) {
+          const h = hashSecret(m.invite)
+          invite = f.invites.find(
+            (i) => i.hash === h && (i.expires === undefined || i.expires > now()),
+          )
+        }
+        if (invite === undefined && f.join !== 'open') return 'invite'
+        const owner = invite?.role === 'owner'
+        // The owner invite is spent once an owner exists, whoever brought it.
+        if (owner && f.members.some((x) => x.role === 'owner')) return 'invite'
+        const role: MemberRole = invite?.role ?? 'author'
+        let id = newCode(8)
+        while (f.members.some((x) => x.id === id)) id = newCode(8)
+        const made: StoredMember = {
+          id,
+          name,
+          role,
+          secret: hash,
+          joined: now(),
+          ...(invite === undefined ? {} : { invite: invite.id }),
+        }
+        f.members.push(made)
+        if (invite !== undefined) {
+          invite.uses -= 1
+          if (invite.uses <= 0) f.invites = f.invites.filter((i) => i !== invite)
+        }
+        return made
+      })
+      if (typeof made === 'string') return refuseSession(conn, made)
+      member = made
+      say(`${member.name} joined as ${member.role}`)
+    }
+    conn.member = member
+    const f = file()
+    const owner = f.members.find((x) => x.role === 'owner')?.name ?? 'the host'
+    sendSession(conn, {
+      sv: SERVER_PROTOCOL,
+      t: 'server',
+      name: f.name || 'Bookdelver server',
+      notice: f.notice,
+      join: f.join,
+      owner,
+      you: shown(member),
+    })
+  }
+
+  function table(conn: Connection, value: unknown) {
+    const v = value as { room?: unknown; build?: unknown; t?: unknown }
+    if (typeof v.room !== 'string' || !isRoomCode(v.room)) return
+    const build = typeof v.build === 'string' && v.build.length > 0 ? v.build.slice(0, 64) : '-'
+    const room = rooms.get(v.room)
+    if (room === undefined) return refuseTable(conn, v.room, build, 'no-room')
+    const t = now()
+    if (v.t === 'propose' && within(conn.proposals, t) > rate.proposalsPerSecond) {
+      return refuseTable(conn, v.room, build, 'slow')
+    }
+    conn.rooms.add(v.room)
+    const relay = room.relay
+    const before = relay.log.length
+    const opened = relay.setup !== undefined
+    const sends = relay.receive(conn.id, value, conn.member!.id)
+    room.active = t
+    if (relay.lobby !== undefined) room.title = relay.lobby.title
+    if (!opened && relay.setup !== undefined) {
+      room.kept = true
+      folder.startRoom(v.room, startLine(v.room, room))
+    } else if (relay.log.length > before) {
+      for (const e of relay.log.slice(before)) folder.addEntry(v.room, e)
+    } else if (v.t === 'join' && room.kept) {
+      // Who holds each place, kept with the start.
+      folder.startRoom(v.room, startLine(v.room, room))
+      for (const e of relay.log) folder.addEntry(v.room, e)
+    }
+    deliver(sends)
+  }
+
+  function startLine(code: string, room: Room) {
+    const r = room.relay
+    return {
+      room: code,
+      build: r.build ?? '-',
+      title: room.title,
+      setup: r.setup,
+      players: r.players,
+      host: r.host,
+      owners: r.placesOwned().map((o) => o ?? null),
+      active: room.active,
+    }
+  }
+
+  function listing(member: string): TableListing[] {
+    const out: TableListing[] = []
+    for (const [code, room] of rooms) {
+      const r = room.relay
+      if (r.lobby !== undefined) {
+        out.push({
+          room: code,
+          title: room.title,
+          host: r.lobby.players[0]!,
+          players: r.lobby.players.length,
+          free: r.lobby.claims.filter((c) => c < 0).length,
+          build: r.build ?? '-',
+          open: false,
+        })
+      } else if (r.setup !== undefined) {
+        out.push({
+          room: code,
+          title: room.title,
+          host: r.players[r.host] ?? '?',
+          players: r.players.length,
+          free: r.present().filter((p) => !p).length,
+          build: r.build ?? '-',
+          open: true,
+          ...(r.placesOwned().includes(member) ? { you: r.placesOwned().indexOf(member) } : {}),
+        })
+      }
+      if (out.length >= SESSION_LIMITS.tables) break
+    }
+    return out
+  }
+
+  function gone(conn: Connection) {
+    conns.delete(conn.id)
+    for (const code of conn.rooms) {
+      const room = rooms.get(code)
+      if (room !== undefined) deliver(room.relay.leave(conn.id))
+    }
+  }
+
+  function closeRoom(code: string) {
+    const room = rooms.get(code)
+    if (room === undefined) return
+    rooms.delete(code)
+    folder.dropRoom(code)
+    for (const conn of conns.values()) {
+      if (!conn.rooms.has(code)) continue
+      conn.rooms.delete(code)
+      refuseTable(conn, code, room.relay.build ?? '-', 'closed')
+    }
+    say(`table ${code} closed`)
+  }
+
+  function sweep() {
+    const t = now()
+    for (const [code, room] of [...rooms]) {
+      if (t - room.active >= LIMITS.idleMs) closeRoom(code)
+    }
+  }
+
+  function invite(role: MemberRole = 'author', uses = 1, hours?: number): string {
+    const secret = newSecret()
+    folder.update(fresh, (f) => {
+      f.invites.push({
+        id: newCode(8),
+        hash: hashSecret(secret),
+        role,
+        uses,
+        ...(hours === undefined ? {} : { expires: now() + hours * 3_600_000 }),
+      })
+    })
+    return encodeInvite({ address: url, invite: secret, name: file().name || 'Bookdelver server' })
+  }
+
+  return {
+    port,
+    url,
+    ownerInvite() {
+      const f = file()
+      const held = f.invites.find((i) => i.role === 'owner' && i.secret !== undefined)
+      if (held?.secret === undefined || f.members.some((m) => m.role === 'owner')) return undefined
+      return encodeInvite({
+        address: url,
+        invite: held.secret,
+        name: f.name || 'Bookdelver server',
+      })
+    },
+    invite,
+    closeRoom,
+    sweep,
+    async close() {
+      clearInterval(sweeper)
+      clearInterval(heartbeat)
+      for (const conn of conns.values()) conn.ws.close(1001, 'the server is stopping')
+      await new Promise<void>((resolve) => wss.close(() => resolve()))
+      for (const conn of conns.values()) conn.ws.terminate()
+      await new Promise<void>((resolve) => http.close(() => resolve()))
+    },
+  }
+}

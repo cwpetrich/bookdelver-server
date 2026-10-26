@@ -1,0 +1,5 @@
+# Caddy in front of the Bookdelver server: HTTPS for your name, by itself.
+# Replace the name with yours; its DNS must point at this machine.
+tables.example.net {
+	reverse_proxy bookdelver:8787
+}

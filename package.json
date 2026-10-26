@@ -1,0 +1,47 @@
+{
+  "name": "bookdelver-server",
+  "description": "Run your own server for Bookdelver tables: your group's online play, hosted by you.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "author": "Sidequestered",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cwpetrich/bookdelver-server.git"
+  },
+  "homepage": "https://github.com/cwpetrich/bookdelver-server#readme",
+  "keywords": [
+    "bookdelver",
+    "game-server",
+    "websocket",
+    "self-hosted"
+  ],
+  "bin": {
+    "bookdelver-server": "dist/bookdelver-server.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "rolldown src/main.ts --file dist/bookdelver-server.mjs --format esm --platform node --external ws",
+    "prepack": "npm run build",
+    "start": "node src/main.ts",
+    "typecheck": "tsc -p .",
+    "test": "vitest run --testTimeout=20000"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/ws": "^8.18.2",
+    "rolldown": "^1.2.12",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.11"
+  }
+}
