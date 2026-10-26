@@ -172,6 +172,27 @@ The program comes with no warranty (see `LICENSE`).
 - **The tests:** `npm ci && npm test` runs the conformance suite against a
   server started on a free port of this machine.
 
+### Making a release (Sidequestered's steps)
+
+The server is developed in the Bookdelver repository (`packages/server`)
+and published from this repository, `github.com/cwpetrich/bookdelver-server`.
+A release goes like this:
+
+1. **Re-export over the working copy.** In the Bookdelver repository, run
+   `npm run server:export -- <working copy> --over`. It replaces everything
+   but `.git` and `node_modules`, and writes a fresh lock.
+2. **Check it.** In the working copy, run
+   `npm ci && npm run typecheck && npm test && npm run build`.
+3. **Bump the version.** It is bumped in `packages/server/package.json`
+   before the export (0.1.0, then 0.2.0, …), so the export already carries
+   it.
+4. **Commit** with the no-reply identity:
+   `git -c user.name=cwpetrich -c user.email=6043021+cwpetrich@users.noreply.github.com commit -am "bookdelver-server X.Y.Z"`.
+5. **Tag and push:** `git tag vX.Y.Z && git push origin main vX.Y.Z`. The tag
+   builds and pushes the image (`.github/workflows/image.yml`).
+6. **npm**, by the npm account's owner: `npm login`, then `npm publish`
+   (`prepack` builds the bundle).
+
 ## Licence
 
 MIT (`LICENSE`), copyright Sidequestered. The five files in `src/shared/`

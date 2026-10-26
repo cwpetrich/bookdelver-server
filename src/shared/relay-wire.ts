@@ -120,6 +120,8 @@ export type RefuseReason =
   | 'slow'
   /** The room is closed: its host closed it, or it lay idle too long. */
   | 'closed'
+  /** Kicked from this table by the server's host or a moderator. */
+  | 'kicked'
 
 export const REFUSE_REASONS: readonly RefuseReason[] = [
   'build',
@@ -134,6 +136,7 @@ export const REFUSE_REASONS: readonly RefuseReason[] = [
   'name',
   'slow',
   'closed',
+  'kicked',
 ]
 
 export type WireResult<T> = { ok: T } | { problems: string[] }

@@ -65,7 +65,8 @@ messages strictly (`readToServer`, `readFromServer`):
 - **`tables.list`**: up to 50 entries of
   `{ room, title, host, players, free, build, open, you? }` (`you`: the asker's own place at an open table).
 - **Refusals** (`SessionRefuse`): `version` (with `want`, the version
-  needed), `invite`, `secret`, `name`, `slow`, `garbled`, `full`.
+  needed), `invite`, `secret`, `name`, `slow`, `garbled`, `full`,
+  `banned`, `removed`, `forbidden`.
 - **`leave { forget: true }`**: the server deletes the member's record.
 
 ### Invites
@@ -76,6 +77,41 @@ text or as a QR code.
 
 The reference server prints the **owner invite** when it first starts.
 Whoever brings it is made the owner.
+
+### Reports and the host's tools (session 1, SH2)
+
+| A phone sends                                             | The server answers                            | Who may                                     |
+| --------------------------------------------------------- | --------------------------------------------- | ------------------------------------------- |
+| `report { reason, member?, room? }`                       | `reported`                                    | any member                                  |
+| `invite { role, uses, hours? }`                           | `invite { id, secret, role, uses, expires? }` | owner; a moderator, for authors and members |
+| `invites`                                                 | `invites { list }`                            | owner, moderator                            |
+| `revoke { invite }`                                       | `invites { list }`                            | owner, moderator                            |
+| `members`                                                 | `members { list }`                            | owner, moderator                            |
+| `kick { member, room }`                                   | `members { list }`                            | owner, moderator                            |
+| `remove { member }`, `ban { member }`, `unban { member }` | `members { list }`                            | owner, moderator                            |
+| `role { member, role }`                                   | `members { list }`                            | owner                                       |
+| `settings { name?, notice?, join? }`                      | `server { … }`                                | owner                                       |
+| `reports`, `dismiss { report }`                           | `reports { list }`                            | owner, moderator                            |
+
+- **`reason`**: one of `offensive`, `cheating`, `spam` or `other`. There is
+  no free text. A report names a member, a table or both.
+- **A host's tool reaches only those below them**: owner, then moderator,
+  then author and member. Anything else is refused with `forbidden`. No one
+  can make an owner invite in the app.
+- **An invite** is answered once with its secret. The phone builds the
+  `bdinv1.` code from the address it reached. Lists never show a secret.
+- **`kick`**: the member's connections in that room are let go (its
+  presence changes, so the host's phone hands the seat to the AI after its
+  wait) and refused (`kicked`, table layer) if they come back to that room.
+- **`remove`** deletes the member's record. Their connections are told
+  `removed` and closed, and their secret no longer works.
+- **`ban`** keeps the record, marked. Their connections are told `banned`
+  and closed, `hello` with their secret is refused with `banned`, and the
+  invites they made are revoked. **`unban`** lifts it.
+- **Lists**: up to 1,000 entries each. Invites are `{ id, role, uses,
+expires?, by? }`, members `{ id, name, role, joined, banned }`, and
+  reports `{ id, by, member?: { id, name }, room?, reason, at }`. Times are
+  in milliseconds since 1970.
 
 ## The table layer: lockstep `v` 2
 
@@ -120,7 +156,7 @@ input no phone can read is dropped by every phone alike (verdict
 | `refuse { reason, want }`                       | Turned away. `want` is the room's build (`-` before a room opens)         |
 
 Refusals (`RefuseReason`): `build`, `protocol`, `no-room`, `open`, `taken`,
-`player`, `full`, `garbled`, `crowd`, `name`, `slow`, `closed`.
+`player`, `full`, `garbled`, `crowd`, `name`, `slow`, `closed`, `kicked`.
 
 **Rules a relay keeps:**
 

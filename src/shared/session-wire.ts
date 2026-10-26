@@ -33,8 +33,9 @@ export const SESSION_LIMITS = {
   secret: 43,
   /** A member's id: the server's, 8 characters of the share codes' alphabet. */
   id: 8,
-  /** Tables a list shows. */
+  /** Tables a list shows; invites, members and reports a host's list shows. */
   tables: 50,
+  listed: 1_000,
   /** A table's title (the scenario's) and its build. */
   title: 80,
   build: 64,
@@ -62,6 +63,8 @@ export interface TableListing {
   title: string
   /** The host's name. */
   host: string
+  /** The host's member id (SH2): what a phone blocks or reports them by. */
+  hostId?: string
   /** Players sat down, and seats nobody has taken yet (a lobby's). */
   players: number
   free: number
@@ -71,6 +74,44 @@ export interface TableListing {
   open: boolean
   /** The asker's own place at it, if they hold one: to come back to. */
   you?: number
+}
+
+/** An invite, as its host's tools list it (SH2): never its secret. */
+export interface InviteListing {
+  id: string
+  role: MemberRole
+  /** Uses left. */
+  uses: number
+  /** When it stops working (ms since 1970); none, never. */
+  expires?: number
+  /** Who made it, by name: none, the server's command line. */
+  by?: string
+}
+
+/** A member, as the host's tools list them. */
+export interface MemberListing extends Member {
+  /** When they joined (ms since 1970). */
+  joined: number
+  /** Banned: their secret no longer works here, and their invites are revoked. */
+  banned: boolean
+}
+
+/** Why a member reports another or a table (section 5): a closed list, no free text. */
+export type ReportReason = 'offensive' | 'cheating' | 'spam' | 'other'
+export const REPORT_REASONS: readonly ReportReason[] = ['offensive', 'cheating', 'spam', 'other']
+
+/** A report, as the host's tools list it. */
+export interface ReportListing {
+  id: string
+  /** Who reported, by name. */
+  by: string
+  /** The member reported, if a member was. */
+  member?: { id: string; name: string }
+  /** The table reported, if one was. */
+  room?: string
+  reason: ReportReason
+  /** When (ms since 1970). */
+  at: number
 }
 
 /** Why a server turns a session away. */
@@ -89,6 +130,12 @@ export type SessionRefuse =
   | 'garbled'
   /** The server has its most members, or its most tables. */
   | 'full'
+  /** Banned from this server. */
+  | 'banned'
+  /** Removed from this server, or kicked: the connection is closed. */
+  | 'removed'
+  /** Not this member's to do: a host's tool, and their role isn't one that may. */
+  | 'forbidden'
 
 export const SESSION_REFUSALS: readonly SessionRefuse[] = [
   'version',
@@ -98,6 +145,9 @@ export const SESSION_REFUSALS: readonly SessionRefuse[] = [
   'slow',
   'garbled',
   'full',
+  'banned',
+  'removed',
+  'forbidden',
 ]
 
 /** What a phone sends a server. */
@@ -118,6 +168,25 @@ export type ToServer = { sv: typeof SERVER_PROTOCOL } & (
   | { t: 'table' }
   /** Leaving the server: `forget`, its record and its entries deleted. */
   | { t: 'leave'; forget: boolean }
+  /** A member reports another, or a table: to the host's inbox. */
+  | { t: 'report'; reason: ReportReason; member?: string; room?: string }
+  // The host's tools (SH2): owners and moderators.
+  /** A new invite: its role, its uses, and how many hours it lasts (none: until used). */
+  | { t: 'invite'; role: MemberRole; uses: number; hours?: number }
+  | { t: 'invites' }
+  | { t: 'revoke'; invite: string }
+  | { t: 'members' }
+  /** A member out of a table (their seat goes to the AI), out of the server, or banned. */
+  | { t: 'kick'; member: string; room: string }
+  | { t: 'remove'; member: string }
+  | { t: 'ban'; member: string }
+  | { t: 'unban'; member: string }
+  /** The owner's: a member's role. */
+  | { t: 'role'; member: string; role: MemberRole }
+  /** The owner's: the server's name, notice and who may join. */
+  | { t: 'settings'; name?: string; notice?: string; join?: JoinPolicy }
+  | { t: 'reports' }
+  | { t: 'dismiss'; report: string }
 )
 
 /** What a server sends a phone. */
@@ -135,6 +204,13 @@ export type FromServer = { sv: typeof SERVER_PROTOCOL } & (
   | { t: 'tables'; list: TableListing[] }
   | { t: 'room'; room: string }
   | { t: 'refuse'; reason: SessionRefuse; want?: number }
+  /** A report taken. */
+  | { t: 'reported' }
+  /** A new invite: its secret, given once; the phone makes the code with the address it reached. */
+  | { t: 'invite'; id: string; secret: string; role: MemberRole; uses: number; expires?: number }
+  | { t: 'invites'; list: InviteListing[] }
+  | { t: 'members'; list: MemberListing[] }
+  | { t: 'reports'; list: ReportListing[] }
 )
 
 export type SessionResult<T> = { ok: T } | { problems: string[] }
@@ -170,6 +246,11 @@ class SessionReader extends Reader {
       return undefined
     }
     return value
+  }
+
+  /** A time: whole milliseconds since 1970, from 2020 to 2200. */
+  time(value: unknown, where: string): number | undefined {
+    return this.whole(value, where, { min: 1_577_836_800_000, max: 7_258_118_400_000 })
   }
 
   /** Text that may be empty (a notice), else as `text` reads it. */
@@ -229,6 +310,19 @@ export function readToServer(value: unknown): SessionResult<ToServer> {
       'tables',
       'table',
       'leave',
+      'report',
+      'invite',
+      'invites',
+      'revoke',
+      'members',
+      'kick',
+      'remove',
+      'ban',
+      'unban',
+      'role',
+      'settings',
+      'reports',
+      'dismiss',
     ] as const)
     const sv = SERVER_PROTOCOL
     switch (t) {
@@ -271,6 +365,107 @@ export function readToServer(value: unknown): SessionResult<ToServer> {
         const forget = o && r.bool(r.field(o, 'forget'), 'forget')
         return forget === undefined ? undefined : { sv, t, forget }
       }
+      case 'report': {
+        const o = r.shape(raw, '', ['sv', 't', 'reason', 'member', 'room'], ['sv', 't', 'reason'])
+        if (o === undefined) return undefined
+        const reason = r.oneOf(r.field(o, 'reason'), 'reason', REPORT_REASONS)
+        const member =
+          r.field(o, 'member') === undefined
+            ? undefined
+            : r.match(r.field(o, 'member'), 'member', ID, 'a member’s id')
+        const room =
+          r.field(o, 'room') === undefined
+            ? undefined
+            : r.match(r.field(o, 'room'), 'room', ROOM, 'a room code')
+        if (reason === undefined || r.problems.length > 0) return undefined
+        if (member === undefined && room === undefined) {
+          r.problem('', 'should name a member or a table')
+          return undefined
+        }
+        return {
+          sv,
+          t,
+          reason,
+          ...(member === undefined ? {} : { member }),
+          ...(room === undefined ? {} : { room }),
+        }
+      }
+      case 'invite': {
+        const o = r.shape(
+          raw,
+          '',
+          ['sv', 't', 'role', 'uses', 'hours'],
+          ['sv', 't', 'role', 'uses'],
+        )
+        if (o === undefined) return undefined
+        const role = r.oneOf(r.field(o, 'role'), 'role', MEMBER_ROLES)
+        const uses = r.whole(r.field(o, 'uses'), 'uses', { min: 1, max: 100 })
+        const hours =
+          r.field(o, 'hours') === undefined
+            ? undefined
+            : r.whole(r.field(o, 'hours'), 'hours', { min: 1, max: 24 * 30 })
+        if (role === undefined || uses === undefined || r.problems.length > 0) return undefined
+        return { sv, t, role, uses, ...(hours === undefined ? {} : { hours }) }
+      }
+      case 'invites':
+      case 'members':
+      case 'reports':
+        return r.shape(raw, '', ['sv', 't']) === undefined ? undefined : { sv, t }
+      case 'revoke': {
+        const o = r.shape(raw, '', ['sv', 't', 'invite'])
+        const invite = o && r.match(r.field(o, 'invite'), 'invite', ID, 'an invite’s id')
+        return invite === undefined ? undefined : { sv, t, invite }
+      }
+      case 'dismiss': {
+        const o = r.shape(raw, '', ['sv', 't', 'report'])
+        const report = o && r.match(r.field(o, 'report'), 'report', ID, 'a report’s id')
+        return report === undefined ? undefined : { sv, t, report }
+      }
+      case 'remove':
+      case 'ban':
+      case 'unban': {
+        const o = r.shape(raw, '', ['sv', 't', 'member'])
+        const member = o && r.match(r.field(o, 'member'), 'member', ID, 'a member’s id')
+        return member === undefined ? undefined : { sv, t, member }
+      }
+      case 'kick': {
+        const o = r.shape(raw, '', ['sv', 't', 'member', 'room'])
+        if (o === undefined) return undefined
+        const member = r.match(r.field(o, 'member'), 'member', ID, 'a member’s id')
+        const room = r.match(r.field(o, 'room'), 'room', ROOM, 'a room code')
+        return member === undefined || room === undefined ? undefined : { sv, t, member, room }
+      }
+      case 'role': {
+        const o = r.shape(raw, '', ['sv', 't', 'member', 'role'])
+        if (o === undefined) return undefined
+        const member = r.match(r.field(o, 'member'), 'member', ID, 'a member’s id')
+        const role = r.oneOf(r.field(o, 'role'), 'role', MEMBER_ROLES)
+        return member === undefined || role === undefined ? undefined : { sv, t, member, role }
+      }
+      case 'settings': {
+        const o = r.shape(raw, '', ['sv', 't', 'name', 'notice', 'join'], ['sv', 't'])
+        if (o === undefined) return undefined
+        const name =
+          r.field(o, 'name') === undefined
+            ? undefined
+            : r.text(r.field(o, 'name'), 'name', SESSION_LIMITS.serverName)
+        const notice =
+          r.field(o, 'notice') === undefined
+            ? undefined
+            : r.maybeEmpty(r.field(o, 'notice'), 'notice', SESSION_LIMITS.notice)
+        const join =
+          r.field(o, 'join') === undefined
+            ? undefined
+            : r.oneOf(r.field(o, 'join'), 'join', ['invite', 'open'] as const)
+        if (r.problems.length > 0) return undefined
+        return {
+          sv,
+          t,
+          ...(name === undefined ? {} : { name }),
+          ...(notice === undefined ? {} : { notice }),
+          ...(join === undefined ? {} : { join }),
+        }
+      }
     }
   })
 }
@@ -293,6 +488,11 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
       'tables',
       'room',
       'refuse',
+      'reported',
+      'invite',
+      'invites',
+      'members',
+      'reports',
     ] as const)
     const sv = SERVER_PROTOCOL
     switch (t) {
@@ -327,7 +527,7 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
         for (let i = 0; i < list.length; i++) {
           const w = `list[${i}]`
           const keys = ['room', 'title', 'host', 'players', 'free', 'build', 'open']
-          const e = r.shape(list[i], w, [...keys, 'you'], keys)
+          const e = r.shape(list[i], w, [...keys, 'you', 'hostId'], keys)
           if (e === undefined) return undefined
           const room = r.match(r.field(e, 'room'), `${w}.room`, ROOM, 'a room code')
           const title = r.text(r.field(e, 'title'), `${w}.title`, SESSION_LIMITS.title)
@@ -351,8 +551,13 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
             r.field(e, 'you') === undefined
               ? undefined
               : r.whole(r.field(e, 'you'), `${w}.you`, { min: 0, max: 5 })
+          const hostId =
+            r.field(e, 'hostId') === undefined
+              ? undefined
+              : r.match(r.field(e, 'hostId'), `${w}.hostId`, ID, 'a member’s id')
           if (r.problems.length > 0) return undefined
           out.push({
+            ...(hostId === undefined ? {} : { hostId }),
             room,
             title,
             host,
@@ -361,6 +566,136 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
             build,
             open,
             ...(you === undefined ? {} : { you }),
+          })
+        }
+        return { sv, t, list: out }
+      }
+      case 'reported':
+        return r.shape(raw, '', ['sv', 't']) === undefined ? undefined : { sv, t }
+      case 'invite': {
+        const keys = ['sv', 't', 'id', 'secret', 'role', 'uses', 'expires']
+        const o = r.shape(raw, '', keys, keys.slice(0, -1))
+        if (o === undefined) return undefined
+        const id = r.match(r.field(o, 'id'), 'id', ID, 'an invite’s id')
+        const secret = r.match(r.field(o, 'secret'), 'secret', SECRET, 'a secret')
+        const role = r.oneOf(r.field(o, 'role'), 'role', MEMBER_ROLES)
+        const uses = r.whole(r.field(o, 'uses'), 'uses', { min: 1, max: 100 })
+        const expires =
+          r.field(o, 'expires') === undefined ? undefined : r.time(r.field(o, 'expires'), 'expires')
+        if (id === undefined || secret === undefined || role === undefined || uses === undefined) {
+          return undefined
+        }
+        if (r.problems.length > 0) return undefined
+        return { sv, t, id, secret, role, uses, ...(expires === undefined ? {} : { expires }) }
+      }
+      case 'invites': {
+        const o = r.shape(raw, '', ['sv', 't', 'list'])
+        const list = o && r.list(r.field(o, 'list'), 'list', SESSION_LIMITS.listed)
+        if (list === undefined) return undefined
+        const out: InviteListing[] = []
+        for (let i = 0; i < list.length; i++) {
+          const w = `list[${i}]`
+          const e = r.shape(
+            list[i],
+            w,
+            ['id', 'role', 'uses', 'expires', 'by'],
+            ['id', 'role', 'uses'],
+          )
+          if (e === undefined) return undefined
+          const id = r.match(r.field(e, 'id'), `${w}.id`, ID, 'an invite’s id')
+          const role = r.oneOf(r.field(e, 'role'), `${w}.role`, MEMBER_ROLES)
+          const uses = r.whole(r.field(e, 'uses'), `${w}.uses`, { min: 0, max: 100 })
+          const expires =
+            r.field(e, 'expires') === undefined
+              ? undefined
+              : r.time(r.field(e, 'expires'), `${w}.expires`)
+          const by =
+            r.field(e, 'by') === undefined
+              ? undefined
+              : r.text(r.field(e, 'by'), `${w}.by`, SESSION_LIMITS.name)
+          if (
+            id === undefined ||
+            role === undefined ||
+            uses === undefined ||
+            r.problems.length > 0
+          ) {
+            return undefined
+          }
+          out.push({
+            id,
+            role,
+            uses,
+            ...(expires === undefined ? {} : { expires }),
+            ...(by === undefined ? {} : { by }),
+          })
+        }
+        return { sv, t, list: out }
+      }
+      case 'members': {
+        const o = r.shape(raw, '', ['sv', 't', 'list'])
+        const list = o && r.list(r.field(o, 'list'), 'list', SESSION_LIMITS.listed)
+        if (list === undefined) return undefined
+        const out: MemberListing[] = []
+        for (let i = 0; i < list.length; i++) {
+          const w = `list[${i}]`
+          const e = r.shape(list[i], w, ['id', 'name', 'role', 'joined', 'banned'])
+          if (e === undefined) return undefined
+          const m = r.member(
+            { id: r.field(e, 'id'), name: r.field(e, 'name'), role: r.field(e, 'role') },
+            w,
+          )
+          const joined = r.time(r.field(e, 'joined'), `${w}.joined`)
+          const banned = r.bool(r.field(e, 'banned'), `${w}.banned`)
+          if (m === undefined || joined === undefined || banned === undefined) return undefined
+          out.push({ ...m, joined, banned })
+        }
+        return { sv, t, list: out }
+      }
+      case 'reports': {
+        const o = r.shape(raw, '', ['sv', 't', 'list'])
+        const list = o && r.list(r.field(o, 'list'), 'list', SESSION_LIMITS.listed)
+        if (list === undefined) return undefined
+        const out: ReportListing[] = []
+        for (let i = 0; i < list.length; i++) {
+          const w = `list[${i}]`
+          const e = r.shape(
+            list[i],
+            w,
+            ['id', 'by', 'member', 'room', 'reason', 'at'],
+            ['id', 'by', 'reason', 'at'],
+          )
+          if (e === undefined) return undefined
+          const id = r.match(r.field(e, 'id'), `${w}.id`, ID, 'a report’s id')
+          const by = r.text(r.field(e, 'by'), `${w}.by`, SESSION_LIMITS.name)
+          const reason = r.oneOf(r.field(e, 'reason'), `${w}.reason`, REPORT_REASONS)
+          const at = r.time(r.field(e, 'at'), `${w}.at`)
+          let member: { id: string; name: string } | undefined
+          if (r.field(e, 'member') !== undefined) {
+            const mo = r.shape(r.field(e, 'member'), `${w}.member`, ['id', 'name'])
+            const mid = mo && r.match(r.field(mo, 'id'), `${w}.member.id`, ID, 'a member’s id')
+            const mname = mo && r.text(r.field(mo, 'name'), `${w}.member.name`, SESSION_LIMITS.name)
+            if (mid !== undefined && mname !== undefined) member = { id: mid, name: mname }
+          }
+          const room =
+            r.field(e, 'room') === undefined
+              ? undefined
+              : r.match(r.field(e, 'room'), `${w}.room`, ROOM, 'a room code')
+          if (
+            id === undefined ||
+            by === undefined ||
+            reason === undefined ||
+            at === undefined ||
+            r.problems.length > 0
+          ) {
+            return undefined
+          }
+          out.push({
+            id,
+            by,
+            reason,
+            at,
+            ...(member === undefined ? {} : { member }),
+            ...(room === undefined ? {} : { room }),
           })
         }
         return { sv, t, list: out }

@@ -1,7 +1,7 @@
 {
   "name": "bookdelver-server",
   "description": "Run your own server for Bookdelver tables: your group's online play, hosted by you.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "author": "Sidequestered",
   "type": "module",

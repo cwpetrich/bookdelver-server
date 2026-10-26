@@ -18,6 +18,7 @@ import {
   SESSION_LIMITS,
   type SessionRefuse,
   type TableListing,
+  type ToServer,
   encodeInvite,
   isSession,
   readToServer,
@@ -96,6 +97,8 @@ export const LIMITS = {
   /** Rooms at once, and members kept. */
   rooms: 200,
   members: 1_000,
+  /** Reports kept for the inbox: the oldest go past it. */
+  reports: 500,
   /**
    * A message's bytes on the wire (`ws`'s `maxPayload`): the protocol's cap
    * of 1,000,000 characters at UTF-8's 4 bytes a character at most; the
@@ -114,6 +117,10 @@ interface Room {
   active: number
   /** Whether its start is on disk (it has opened). */
   kept: boolean
+  /** Members kicked from it (SH2): refused if they come back. */
+  kicked: Set<string>
+  /** The member who asked for it: its host. */
+  hostId?: string
 }
 
 interface Connection {
@@ -141,6 +148,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     join: opts.join ?? 'invite',
     members: [],
     invites: [],
+    reports: [],
   })
   // The owner invite on a first start, kept until it's used.
   folder.update(fresh, (file) => {
@@ -162,7 +170,13 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     )
     // The setup as it was sent, not with the fields above laid over it.
     relay.setup = start.setup
-    rooms.set(start.room, { relay, title: start.title, active: start.active, kept: true })
+    rooms.set(start.room, {
+      relay,
+      title: start.title,
+      active: start.active,
+      kept: true,
+      kicked: new Set(),
+    })
   }
   const conns = new Map<string, Connection>()
   let nextConn = 1
@@ -318,7 +332,14 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         if (rooms.size >= LIMITS.rooms) return refuseSession(conn, 'full')
         let code = newCode(6)
         while (rooms.has(code)) code = newCode(6)
-        rooms.set(code, { relay: new Relay(code), title: 'A table', active: now(), kept: false })
+        rooms.set(code, {
+          relay: new Relay(code),
+          title: 'A table',
+          active: now(),
+          kept: false,
+          kicked: new Set(),
+          hostId: member.id,
+        })
         say(`${member.name} opened table ${code}`)
         return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'room', room: code })
       }
@@ -332,7 +353,222 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         conn.ws.close(1000, 'left')
         return
       }
+      case 'report': {
+        folder.update(fresh, (f) => {
+          f.reports.push({
+            id: newCode(8),
+            by: member.id,
+            reason: m.reason,
+            at: now(),
+            ...(m.member === undefined ? {} : { member: m.member }),
+            ...(m.room === undefined ? {} : { room: m.room }),
+          })
+          if (f.reports.length > LIMITS.reports) f.reports.shift()
+        })
+        say(`${member.name} reported ${m.member ?? m.room ?? '?'} (${m.reason})`)
+        return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'reported' })
+      }
+      default:
+        return tools(conn, member, m)
     }
+  }
+
+  /** How far each role reaches: a host's tool reaches only those below. */
+  const RANK: Record<MemberRole, number> = { owner: 3, moderator: 2, author: 1, member: 0 }
+
+  /**
+   * The host's tools (docs/proposals/self-hosted-servers.md, section 5;
+   * slice SH2): owners and moderators. A moderator acts on authors and
+   * members only, and makes invites for them only; roles and settings are
+   * the owner's.
+   */
+  function tools(
+    conn: Connection,
+    actor: StoredMember,
+    m: Exclude<ToServer, { t: 'hello' | 'rename' | 'tables' | 'table' | 'leave' | 'report' }>,
+  ) {
+    const me = file().members.find((x) => x.id === actor.id)
+    if (me === undefined || RANK[me.role] < RANK.moderator) return refuseSession(conn, 'forbidden')
+    const owner = me.role === 'owner'
+    /** The member `id`, if this actor reaches them. */
+    const target = (id: string) => {
+      const t = file().members.find((x) => x.id === id)
+      return t !== undefined && RANK[t.role] < RANK[me.role] ? t : undefined
+    }
+    switch (m.t) {
+      case 'invite': {
+        if (m.role === 'owner' || (!owner && RANK[m.role] >= RANK.moderator)) {
+          return refuseSession(conn, 'forbidden')
+        }
+        const secret = newSecret()
+        const id = newCode(8)
+        const expires = m.hours === undefined ? undefined : now() + m.hours * 3_600_000
+        folder.update(fresh, (f) => {
+          f.invites.push({
+            id,
+            hash: hashSecret(secret),
+            role: m.role,
+            uses: m.uses,
+            by: me.id,
+            ...(expires === undefined ? {} : { expires }),
+          })
+        })
+        say(`${me.name} made an invite (${m.role}, ${m.uses})`)
+        return sendSession(conn, {
+          sv: SERVER_PROTOCOL,
+          t: 'invite',
+          id,
+          secret,
+          role: m.role,
+          uses: m.uses,
+          ...(expires === undefined ? {} : { expires }),
+        })
+      }
+      case 'invites':
+        return sendInvites(conn)
+      case 'revoke':
+        folder.update(fresh, (f) => {
+          f.invites = f.invites.filter((i) => i.id !== m.invite || i.role === 'owner')
+        })
+        return sendInvites(conn)
+      case 'members':
+        return sendMembers(conn)
+      case 'kick': {
+        const t = target(m.member)
+        const room = rooms.get(m.room)
+        if (t === undefined || room === undefined) return refuseSession(conn, 'forbidden')
+        room.kicked.add(t.id)
+        for (const c of conns.values()) {
+          if (c.member?.id !== t.id || !c.rooms.has(m.room)) continue
+          c.rooms.delete(m.room)
+          deliver(room.relay.leave(c.id))
+          refuseTable(c, m.room, room.relay.build ?? '-', 'kicked')
+        }
+        say(`${me.name} kicked ${t.name} from table ${m.room}`)
+        return sendMembers(conn)
+      }
+      case 'remove':
+      case 'ban': {
+        const t = target(m.member)
+        if (t === undefined) return refuseSession(conn, 'forbidden')
+        folder.update(fresh, (f) => {
+          if (m.t === 'remove') f.members = f.members.filter((x) => x.id !== t.id)
+          else {
+            const kept = f.members.find((x) => x.id === t.id)
+            if (kept !== undefined) kept.banned = true
+            // A banned member's invites go with them.
+            f.invites = f.invites.filter((i) => i.by !== t.id)
+          }
+        })
+        shut(t.id, m.t === 'remove' ? 'removed' : 'banned')
+        say(`${me.name} ${m.t === 'remove' ? 'removed' : 'banned'} ${t.name}`)
+        return sendMembers(conn)
+      }
+      case 'unban': {
+        const t = target(m.member)
+        if (t === undefined) return refuseSession(conn, 'forbidden')
+        folder.update(fresh, (f) => {
+          const kept = f.members.find((x) => x.id === t.id)
+          if (kept !== undefined) delete kept.banned
+        })
+        return sendMembers(conn)
+      }
+      case 'role': {
+        const t = target(m.member)
+        if (!owner || t === undefined || m.role === 'owner') return refuseSession(conn, 'forbidden')
+        folder.update(fresh, (f) => {
+          const kept = f.members.find((x) => x.id === t.id)
+          if (kept !== undefined) kept.role = m.role
+        })
+        for (const c of conns.values()) if (c.member?.id === t.id) c.member.role = m.role
+        return sendMembers(conn)
+      }
+      case 'settings': {
+        if (!owner) return refuseSession(conn, 'forbidden')
+        folder.update(fresh, (f) => {
+          if (m.name !== undefined) f.name = m.name
+          if (m.notice !== undefined) f.notice = m.notice
+          if (m.join !== undefined) f.join = m.join
+        })
+        return sendServer(conn, me)
+      }
+      case 'reports':
+        return sendReports(conn)
+      case 'dismiss':
+        folder.update(fresh, (f) => {
+          f.reports = f.reports.filter((x) => x.id !== m.report)
+        })
+        return sendReports(conn)
+    }
+  }
+
+  /** A member's every connection closed, told why. */
+  function shut(id: string, why: 'removed' | 'banned') {
+    for (const c of conns.values()) {
+      if (c.member?.id !== id) continue
+      refuseSession(c, why)
+      c.ws.close(1008, why)
+    }
+  }
+
+  function nameOf(id: string): string {
+    return file().members.find((x) => x.id === id)?.name ?? 'someone gone'
+  }
+
+  function sendInvites(conn: Connection) {
+    const t = now()
+    const list = file()
+      .invites.filter((i) => i.role !== 'owner' && (i.expires === undefined || i.expires > t))
+      .slice(-SESSION_LIMITS.listed)
+      .map((i) => ({
+        id: i.id,
+        role: i.role,
+        uses: i.uses,
+        ...(i.expires === undefined ? {} : { expires: i.expires }),
+        ...(i.by === undefined ? {} : { by: nameOf(i.by) }),
+      }))
+    sendSession(conn, { sv: SERVER_PROTOCOL, t: 'invites', list })
+  }
+
+  function sendMembers(conn: Connection) {
+    const list = file()
+      .members.slice(0, SESSION_LIMITS.listed)
+      .map((x) => ({
+        id: x.id,
+        name: x.name,
+        role: x.role,
+        joined: x.joined,
+        banned: x.banned === true,
+      }))
+    sendSession(conn, { sv: SERVER_PROTOCOL, t: 'members', list })
+  }
+
+  function sendReports(conn: Connection) {
+    const list = file()
+      .reports.slice(-SESSION_LIMITS.listed)
+      .map((x) => ({
+        id: x.id,
+        by: nameOf(x.by),
+        reason: x.reason,
+        at: x.at,
+        ...(x.member === undefined ? {} : { member: { id: x.member, name: nameOf(x.member) } }),
+        ...(x.room === undefined ? {} : { room: x.room }),
+      }))
+    sendSession(conn, { sv: SERVER_PROTOCOL, t: 'reports', list })
+  }
+
+  function sendServer(conn: Connection, member: StoredMember) {
+    const f = file()
+    const owner = f.members.find((x) => x.role === 'owner')?.name ?? 'the host'
+    sendSession(conn, {
+      sv: SERVER_PROTOCOL,
+      t: 'server',
+      name: f.name || 'Bookdelver server',
+      notice: f.notice,
+      join: f.join,
+      owner,
+      you: shown(member),
+    })
   }
 
   function shown(m: StoredMember): Member {
@@ -346,6 +582,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     if (conn.member !== undefined) return
     const hash = hashSecret(m.secret)
     let member = file().members.find((x) => x.secret === hash)
+    if (member?.banned === true) return refuseSession(conn, 'banned')
     if (member === undefined) {
       const name = m.name
       if (name === undefined) return refuseSession(conn, 'secret')
@@ -386,17 +623,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
       say(`${member.name} joined as ${member.role}`)
     }
     conn.member = member
-    const f = file()
-    const owner = f.members.find((x) => x.role === 'owner')?.name ?? 'the host'
-    sendSession(conn, {
-      sv: SERVER_PROTOCOL,
-      t: 'server',
-      name: f.name || 'Bookdelver server',
-      notice: f.notice,
-      join: f.join,
-      owner,
-      you: shown(member),
-    })
+    sendServer(conn, member)
   }
 
   function table(conn: Connection, value: unknown) {
@@ -405,6 +632,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     const build = typeof v.build === 'string' && v.build.length > 0 ? v.build.slice(0, 64) : '-'
     const room = rooms.get(v.room)
     if (room === undefined) return refuseTable(conn, v.room, build, 'no-room')
+    if (room.kicked.has(conn.member!.id)) return refuseTable(conn, v.room, build, 'kicked')
     const t = now()
     if (v.t === 'propose' && within(conn.proposals, t) > rate.proposalsPerSecond) {
       return refuseTable(conn, v.room, build, 'slow')
@@ -447,8 +675,11 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     const out: TableListing[] = []
     for (const [code, room] of rooms) {
       const r = room.relay
+      const hostId = room.hostId ?? r.placesOwned()[r.host]
+      const by = hostId === undefined ? {} : { hostId }
       if (r.lobby !== undefined) {
         out.push({
+          ...by,
           room: code,
           title: room.title,
           host: r.lobby.players[0]!,
@@ -459,6 +690,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         })
       } else if (r.setup !== undefined) {
         out.push({
+          ...by,
           room: code,
           title: room.title,
           host: r.players[r.host] ?? '?',

@@ -258,7 +258,16 @@ describe('a table, by the protocol alone', () => {
     const { room, sam, kiku } = await gathered(s)
     sam.send({ sv: 1, t: 'tables' })
     expect((await sam.session('tables')).list).toEqual([
-      { room, title: 'A table', host: 'Sam', players: 2, free: 0, build: BUILD, open: false },
+      {
+        hostId: expect.stringMatching(/^[0-9A-Z]{8}$/),
+        room,
+        title: 'A table',
+        host: 'Sam',
+        players: 2,
+        free: 0,
+        build: BUILD,
+        open: false,
+      },
     ])
     sam.send({ ...env(room), t: 'open', setup: SETUP })
     // The setup comes back to each as it was sent: carried, not read.
@@ -351,6 +360,156 @@ describe('a table, by the protocol alone', () => {
     await kiku.next(typed('welcome'))
     for (let i = 0; i < 30; i++) kiku.send({ ...env(room), t: 'propose', input: { i } })
     await kiku.next(typed('refuse', (m) => m.reason === 'slow'))
+  })
+})
+
+describe('the host’s tools (SH2)', () => {
+  /** The owner, and a member by an invite the owner made in the app. */
+  async function hosted() {
+    const { s } = await server()
+    const sam = await hello(s.port, 1, { invite: inviteOf(s.ownerInvite()!), name: 'Sam' })
+    await sam.session('server')
+    sam.send({ sv: 1, t: 'invite', role: 'author', uses: 2, hours: 24 })
+    const made = await sam.session('invite')
+    expect(made).toMatchObject({ role: 'author', uses: 2 })
+    expect(made.expires).toBeGreaterThan(Date.now())
+    const kiku = await hello(s.port, 2, { invite: made.secret, name: 'Kiku' })
+    expect(await kiku.session('server')).toMatchObject({ you: { name: 'Kiku', role: 'author' } })
+    return { s, sam, kiku, made }
+  }
+
+  it('makes, lists and revokes invites, and keeps the tools for owners and moderators', async () => {
+    const { s, sam, kiku, made } = await hosted()
+    let from = sam.got.length
+    sam.send({ sv: 1, t: 'invites' })
+    expect((await sam.session('invites', from)).list).toEqual([
+      { id: made.id, role: 'author', uses: 1, expires: made.expires, by: 'Sam' },
+    ])
+    sam.send({ sv: 1, t: 'revoke', invite: made.id })
+    from = sam.got.length
+    expect((await sam.session('invites', from)).list).toEqual([])
+    const late = await hello(s.port, 3, { invite: made.secret, name: 'Ana' })
+    expect(await late.session('refuse')).toMatchObject({ reason: 'invite' })
+    // An author has no tools; a moderator has some, and makes no moderators.
+    kiku.send({ sv: 1, t: 'members' })
+    expect(await kiku.session('refuse')).toMatchObject({ reason: 'forbidden' })
+    const kikuId = (await kiku.session('server')).you.id
+    sam.send({ sv: 1, t: 'role', member: kikuId, role: 'moderator' })
+    from = sam.got.length
+    expect((await sam.session('members', from)).list.map((m) => [m.name, m.role])).toEqual([
+      ['Sam', 'owner'],
+      ['Kiku', 'moderator'],
+    ])
+    from = kiku.got.length
+    kiku.send({ sv: 1, t: 'invite', role: 'moderator', uses: 1 })
+    expect(await kiku.session('refuse', from)).toMatchObject({ reason: 'forbidden' })
+    kiku.send({ sv: 1, t: 'invite', role: 'member', uses: 1 })
+    expect(await kiku.session('invite')).toMatchObject({ role: 'member' })
+    // A moderator can't touch the owner, nor change roles or settings.
+    const samId = (await sam.session('server')).you.id
+    from = kiku.got.length
+    kiku.send({ sv: 1, t: 'ban', member: samId })
+    expect(await kiku.session('refuse', from)).toMatchObject({ reason: 'forbidden' })
+    from = kiku.got.length
+    kiku.send({ sv: 1, t: 'settings', notice: 'Mine now' })
+    expect(await kiku.session('refuse', from)).toMatchObject({ reason: 'forbidden' })
+  })
+
+  it('takes reports, lists them for the host, and dismisses them', async () => {
+    const { sam, kiku } = await hosted()
+    const samId = (await sam.session('server')).you.id
+    kiku.send({ sv: 1, t: 'report', member: samId, reason: 'offensive' })
+    await kiku.session('reported')
+    kiku.send({ sv: 1, t: 'report', room: 'K7F2Q9', reason: 'cheating' })
+    await kiku.next(typed('reported'), kiku.got.length)
+    let from = sam.got.length
+    sam.send({ sv: 1, t: 'reports' })
+    let list = (await sam.session('reports', from)).list
+    for (let i = 0; i < 20 && list.length < 2; i++) {
+      from = sam.got.length
+      sam.send({ sv: 1, t: 'reports' })
+      list = (await sam.session('reports', from)).list
+    }
+    expect(list.map((r) => [r.by, r.member?.name ?? r.room, r.reason])).toEqual([
+      ['Kiku', 'Sam', 'offensive'],
+      ['Kiku', 'K7F2Q9', 'cheating'],
+    ])
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'dismiss', report: list[0]!.id })
+    expect((await sam.session('reports', from)).list.length).toBe(1)
+  })
+
+  it('kicks from a table, removes, bans and unbans', async () => {
+    const { s, sam, kiku } = await hosted()
+    const kikuId = (await kiku.session('server')).you.id
+    // A table, Kiku at it: kicked, the host sees them gone, and they can't come back to it.
+    sam.send({ sv: 1, t: 'table' })
+    const { room } = await sam.session('room')
+    sam.send({ ...env(room), t: 'gather', lobby: LOBBY })
+    await sam.next(typed('lobby'))
+    kiku.send({ ...env(room), t: 'sit', name: 'Kiku' })
+    await kiku.next(typed('lobby'))
+    sam.send({ ...env(room), t: 'open', setup: SETUP })
+    await kiku.next(typed('welcome'))
+    sam.send({ sv: 1, t: 'kick', member: kikuId, room })
+    expect(await kiku.next(typed('refuse', (m) => m.reason === 'kicked'))).toBeDefined()
+    expect(
+      await sam.next(typed('presence', (m) => (m.present as boolean[])[1] === false)),
+    ).toBeDefined()
+    let from = kiku.got.length
+    kiku.send({ ...env(room), t: 'join', player: 1, have: 0 })
+    expect(
+      await kiku.next(
+        typed('refuse', (m) => m.reason === 'kicked'),
+        from,
+      ),
+    ).toBeDefined()
+    // Banned: closed, refused on hello, its invites gone; unbanned: back.
+    sam.send({ sv: 1, t: 'role', member: kikuId, role: 'moderator' })
+    await sam.session('members', sam.got.length)
+    kiku.send({ sv: 1, t: 'invite', role: 'member', uses: 5 })
+    const theirs = await kiku.session('invite')
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'role', member: kikuId, role: 'author' })
+    await sam.session('members', from)
+    sam.send({ sv: 1, t: 'ban', member: kikuId })
+    expect(await kiku.session('refuse')).toBeDefined()
+    await kiku.next(() => (kiku.closed ? true : undefined)).catch(() => true)
+    expect(kiku.closed).toBe(true)
+    const banned = await hello(s.port, 2)
+    expect(await banned.session('refuse')).toMatchObject({ reason: 'banned' })
+    const viaTheirs = await hello(s.port, 4, { invite: theirs.secret, name: 'Bo' })
+    expect(await viaTheirs.session('refuse')).toMatchObject({ reason: 'invite' })
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'members' })
+    expect((await sam.session('members', from)).list.find((m) => m.id === kikuId)?.banned).toBe(
+      true,
+    )
+    sam.send({ sv: 1, t: 'unban', member: kikuId })
+    await sam.session('members', from + 1)
+    const back = await hello(s.port, 2)
+    expect(await back.session('server')).toMatchObject({ you: { name: 'Kiku' } })
+    // Removed: closed, and their secret no longer works.
+    sam.send({ sv: 1, t: 'remove', member: kikuId })
+    expect(await back.session('refuse')).toMatchObject({ reason: 'removed' })
+    const gone = await hello(s.port, 2)
+    expect(await gone.session('refuse')).toMatchObject({ reason: 'secret' })
+  })
+
+  it('lets the owner change the name, the notice and who may join', async () => {
+    const { s, sam } = await hosted()
+    const from = sam.got.length
+    sam.send({ sv: 1, t: 'settings', name: 'Crypt Club', notice: 'Fridays.', join: 'open' })
+    expect(await sam.session('server', from)).toMatchObject({
+      name: 'Crypt Club',
+      notice: 'Fridays.',
+      join: 'open',
+    })
+    const walkIn = await hello(s.port, 9, { name: 'Walk-in' })
+    expect(await walkIn.session('server')).toMatchObject({
+      name: 'Crypt Club',
+      you: { role: 'author' },
+    })
   })
 })
 

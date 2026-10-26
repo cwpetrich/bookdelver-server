@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { join } from 'node:path'
-import type { JoinPolicy, MemberRole } from './shared/session-wire.ts'
+import type { JoinPolicy, MemberRole, ReportReason } from './shared/session-wire.ts'
 import type { RelayEntry } from './shared/relay-wire.ts'
 
 /**
@@ -41,6 +41,8 @@ export interface StoredMember {
   joined: number
   /** The invite they came by, if any. */
   invite?: string
+  /** Banned (SH2): their secret is refused here, and their invites were revoked. */
+  banned?: true
 }
 
 export interface StoredInvite {
@@ -57,6 +59,19 @@ export interface StoredInvite {
    * print it again: the one secret the folder holds, and only until then.
    */
   secret?: string
+  /** The member who made it (SH2); none, the command line. */
+  by?: string
+}
+
+/** A report a member made (SH2): for the host's inbox. */
+export interface StoredReport {
+  id: string
+  /** The reporter's member id. */
+  by: string
+  member?: string
+  room?: string
+  reason: ReportReason
+  at: number
 }
 
 export interface ServerFile {
@@ -67,6 +82,8 @@ export interface ServerFile {
   join: JoinPolicy
   members: StoredMember[]
   invites: StoredInvite[]
+  /** Reports for the host's inbox (SH2); a file from before has none. */
+  reports: StoredReport[]
 }
 
 /** A secret's SHA-256, hex. */
@@ -182,6 +199,7 @@ export interface RoomStartLine {
 }
 
 const ROLE_SET = new Set(['owner', 'moderator', 'author', 'member'])
+const REASONS = new Set(['offensive', 'cheating', 'spam', 'other'])
 
 /** A server's file read back, checked field by field, or undefined. */
 export function readServerFile(value: unknown): ServerFile | undefined {
@@ -194,7 +212,7 @@ export function readServerFile(value: unknown): ServerFile | undefined {
   const members: StoredMember[] = []
   for (const m of v.members as Record<string, unknown>[]) {
     if (typeof m !== 'object' || m === null) return undefined
-    const { id, name, role, secret, joined, invite } = m
+    const { id, name, role, secret, joined, invite, banned } = m
     if (typeof id !== 'string' || typeof name !== 'string' || typeof secret !== 'string') {
       return undefined
     }
@@ -206,12 +224,13 @@ export function readServerFile(value: unknown): ServerFile | undefined {
       secret,
       joined,
       ...(typeof invite === 'string' ? { invite } : {}),
+      ...(banned === true ? { banned: true as const } : {}),
     })
   }
   const invites: StoredInvite[] = []
   for (const i of v.invites as Record<string, unknown>[]) {
     if (typeof i !== 'object' || i === null) return undefined
-    const { id, hash, role, uses, expires, secret } = i
+    const { id, hash, role, uses, expires, secret, by } = i
     if (typeof id !== 'string' || typeof hash !== 'string' || typeof uses !== 'number') {
       return undefined
     }
@@ -223,6 +242,22 @@ export function readServerFile(value: unknown): ServerFile | undefined {
       uses,
       ...(typeof expires === 'number' ? { expires } : {}),
       ...(typeof secret === 'string' ? { secret } : {}),
+      ...(typeof by === 'string' ? { by } : {}),
+    })
+  }
+  const reports: StoredReport[] = []
+  for (const x of (Array.isArray(v.reports) ? v.reports : []) as Record<string, unknown>[]) {
+    if (typeof x !== 'object' || x === null) return undefined
+    const { id, by, member, room, reason, at } = x
+    if (typeof id !== 'string' || typeof by !== 'string' || typeof at !== 'number') return undefined
+    if (!REASONS.has(reason as string)) return undefined
+    reports.push({
+      id,
+      by,
+      reason: reason as ReportReason,
+      at,
+      ...(typeof member === 'string' ? { member } : {}),
+      ...(typeof room === 'string' ? { room } : {}),
     })
   }
   return {
@@ -233,5 +268,6 @@ export function readServerFile(value: unknown): ServerFile | undefined {
     join: v.join,
     members,
     invites,
+    reports,
   }
 }
