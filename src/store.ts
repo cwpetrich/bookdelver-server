@@ -12,6 +12,7 @@ import {
 import { join } from 'node:path'
 import type { JoinPolicy, MemberRole, ReportReason } from './shared/session-wire.ts'
 import type { RelayEntry } from './shared/relay-wire.ts'
+import type { LibraryKind } from './shared/library-wire.ts'
 
 /**
  * The data folder (docs/proposals/self-hosted-servers.md, section 1, "Running
@@ -70,6 +71,8 @@ export interface StoredReport {
   by: string
   member?: string
   room?: string
+  /** A library entry reported (SH3). */
+  entry?: string
   reason: ReportReason
   at: number
 }
@@ -248,7 +251,7 @@ export function readServerFile(value: unknown): ServerFile | undefined {
   const reports: StoredReport[] = []
   for (const x of (Array.isArray(v.reports) ? v.reports : []) as Record<string, unknown>[]) {
     if (typeof x !== 'object' || x === null) return undefined
-    const { id, by, member, room, reason, at } = x
+    const { id, by, member, room, entry, reason, at } = x
     if (typeof id !== 'string' || typeof by !== 'string' || typeof at !== 'number') return undefined
     if (!REASONS.has(reason as string)) return undefined
     reports.push({
@@ -258,6 +261,7 @@ export function readServerFile(value: unknown): ServerFile | undefined {
       at,
       ...(typeof member === 'string' ? { member } : {}),
       ...(typeof room === 'string' ? { room } : {}),
+      ...(typeof entry === 'string' ? { entry } : {}),
     })
   }
   return {
@@ -269,5 +273,89 @@ export function readServerFile(value: unknown): ServerFile | undefined {
     members,
     invites,
     reports,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The library (SH3): `library/index.json`, and each version's code as its own
+// file, `library/<entry>/<version>.txt`, one code a file.
+
+/** A version kept: its number, when it came, its content's id, and its listing. */
+export interface StoredVersion {
+  v: number
+  at: number
+  content: string
+  title: string
+  intro: string
+  author: string
+  sort: string
+  cols?: number
+  rows?: number
+  seats?: number
+}
+
+/** An entry: whose, its kind, and its versions kept, oldest first. */
+export interface StoredEntry {
+  id: string
+  kind: LibraryKind
+  by: string
+  versions: StoredVersion[]
+}
+
+export interface LibraryIndex {
+  format: 'bookdelver-library'
+  version: 1
+  entries: StoredEntry[]
+}
+
+export class LibraryFolder {
+  readonly dir: string
+
+  constructor(data: string) {
+    this.dir = join(data, 'library')
+    mkdirSync(this.dir, { recursive: true })
+  }
+
+  private get indexPath() {
+    return join(this.dir, 'index.json')
+  }
+
+  read(): LibraryIndex {
+    if (!existsSync(this.indexPath))
+      return { format: 'bookdelver-library', version: 1, entries: [] }
+    const value = JSON.parse(readFileSync(this.indexPath, 'utf8')) as LibraryIndex
+    if (value.format !== 'bookdelver-library' || !Array.isArray(value.entries)) {
+      throw new Error(`${this.indexPath} doesn’t read as a library`)
+    }
+    return value
+  }
+
+  write(index: LibraryIndex) {
+    writeWhole(this.indexPath, JSON.stringify(index))
+  }
+
+  private codePath(entry: string, v: number) {
+    return join(this.dir, entry, `${v}.txt`)
+  }
+
+  putCode(entry: string, v: number, code: string) {
+    mkdirSync(join(this.dir, entry), { recursive: true })
+    writeWhole(this.codePath(entry, v), code)
+  }
+
+  code(entry: string, v: number): string | undefined {
+    try {
+      return readFileSync(this.codePath(entry, v), 'utf8')
+    } catch {
+      return undefined
+    }
+  }
+
+  dropVersion(entry: string, v: number) {
+    rmSync(this.codePath(entry, v), { force: true })
+  }
+
+  dropEntry(entry: string) {
+    rmSync(join(this.dir, entry), { recursive: true, force: true })
   }
 }

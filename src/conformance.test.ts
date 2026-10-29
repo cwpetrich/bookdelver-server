@@ -3,6 +3,7 @@ import { connect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { crc32, crcHex, toBase64Url, utf8Encode } from './shared/codec.ts'
 import { LOCKSTEP_PROTOCOL } from './shared/relay-wire.ts'
 import { type FromServer, decodeInvite, readFromServer } from './shared/session-wire.ts'
 import { LIMITS, type RunningServer, startServer } from './server.ts'
@@ -513,6 +514,245 @@ describe('the host’s tools (SH2)', () => {
   })
 })
 
+/** A code as an app makes one: its JSON, base64url, its CRC-32 (the library reads no more). */
+function code(prefix: string, value: object): string {
+  const bytes = utf8Encode(JSON.stringify(value))
+  return `${prefix}.${crcHex(crc32(bytes))}.${toBase64Url(bytes)}`
+}
+const scenarioCode = (title: string, extra: object = {}) =>
+  code('bdsc1', {
+    format: 'bookdelver-scenario',
+    title,
+    intro: 'A toll bridge, and bandits.',
+    author: 'Sam',
+    board: { cols: 9, rows: 7, cells: '.' },
+    party: { size: { min: 1, max: 3 } },
+    monsters: [{ hidden: true }],
+    ...extra,
+  })
+const pieceCode = (name: string) =>
+  code('bdhb1', { kind: 'item', name, flavour: 'Cold to the touch.', author: 'Kiku', body: {} })
+
+describe('the library (SH3)', () => {
+  async function authors(now?: () => number) {
+    const { s, data } = await server(undefined, now)
+    const sam = await hello(s.port, 1, { invite: inviteOf(s.ownerInvite()!), name: 'Sam' })
+    const samId = (await sam.session('server')).you.id
+    const kiku = await hello(s.port, 2, { invite: inviteOf(s.invite('author', 3)), name: 'Kiku' })
+    const kikuId = (await kiku.session('server')).you.id
+    const bo = await hello(s.port, 3, { invite: inviteOf(s.invite('member', 1)), name: 'Bo' })
+    await bo.session('server')
+    return { s, data, sam, samId, kiku, kikuId, bo }
+  }
+  const entryOf = (c: Client, from = 0) => c.session('lib.entry', from)
+
+  it('publishes, lists, gives back the code, and keeps versions', async () => {
+    let clock = Date.now()
+    const { sam, samId, kiku, bo } = await authors(() => clock)
+    sam.send({ sv: 1, t: 'lib.publish', code: scenarioCode('The Bandits’ Toll') })
+    const first = (await entryOf(sam)).entry
+    expect(first).toMatchObject({
+      kind: 'scenario',
+      sort: 'scenario',
+      title: 'The Bandits’ Toll',
+      intro: 'A toll bridge, and bandits.',
+      author: 'Sam',
+      by: samId,
+      byName: 'Sam',
+      version: 1,
+      versions: 1,
+      cols: 9,
+      rows: 7,
+      seats: 3,
+    })
+    // Its listing names no monster, nor how many: a scenario's hidden ones stay so.
+    expect(Object.keys(first)).not.toContain('monsters')
+    kiku.send({ sv: 1, t: 'lib.publish', code: pieceCode('Frost Ring') })
+    await entryOf(kiku)
+    bo.send({ sv: 1, t: 'lib.list' })
+    const page = (await bo.session('lib.page')).entries
+    expect(page.map((e) => e.title).sort()).toEqual(['Frost Ring', 'The Bandits’ Toll'])
+    bo.send({ sv: 1, t: 'lib.get', entry: first.id })
+    expect(await bo.session('lib.code')).toMatchObject({
+      entry: first.id,
+      version: 1,
+      code: scenarioCode('The Bandits’ Toll'),
+    })
+    // The same code again is the same version; a changed one, the next.
+    let from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.publish', entry: first.id, code: scenarioCode('The Bandits’ Toll') })
+    expect((await entryOf(sam, from)).entry.version).toBe(1)
+    for (let n = 2; n <= 11; n++) {
+      clock += 7 * 60_000
+      from = sam.got.length
+      sam.send({
+        sv: 1,
+        t: 'lib.publish',
+        entry: first.id,
+        code: scenarioCode(`The Bandits’ Toll ${n}`),
+      })
+      expect((await entryOf(sam, from)).entry).toMatchObject({
+        version: n,
+        versions: Math.min(n, 10),
+      })
+    }
+    // Ten kept: the first version is gone, the second and the newest are there.
+    from = bo.got.length
+    bo.send({ sv: 1, t: 'lib.get', entry: first.id, version: 1 })
+    expect(await bo.session('lib.gone', from)).toMatchObject({ entry: first.id })
+    from = bo.got.length
+    bo.send({ sv: 1, t: 'lib.get', entry: first.id, version: 2 })
+    expect((await bo.session('lib.code', from)).version).toBe(2)
+  })
+
+  it('lists by kind, by member, by title, a page at a time', async () => {
+    let clock = Date.now()
+    const { sam, samId, kiku } = await authors(() => clock)
+    for (let n = 0; n < 56; n++) {
+      clock += 7 * 60_000
+      const c = n % 2 === 0 ? sam : kiku
+      const from = c.got.length
+      c.send({
+        sv: 1,
+        t: 'lib.publish',
+        code: n % 3 === 0 ? pieceCode(`Ring ${n}`) : scenarioCode(`Room ${n}`),
+      })
+      await entryOf(c, from)
+    }
+    let from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.list', kind: 'piece' })
+    expect((await sam.session('lib.page', from)).entries.every((e) => e.kind === 'piece')).toBe(
+      true,
+    )
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.list', by: samId })
+    expect((await sam.session('lib.page', from)).entries.every((e) => e.by === samId)).toBe(true)
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.list', q: 'room 2' })
+    expect((await sam.session('lib.page', from)).entries.map((e) => e.title)).toEqual([
+      'Room 29',
+      'Room 28',
+      'Room 26',
+      'Room 25',
+      'Room 23',
+      'Room 22',
+      'Room 20',
+      'Room 2',
+    ])
+    // Newest first, and a page's `next` picks up where it stopped.
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.list' })
+    const one = await sam.session('lib.page', from)
+    expect(one.entries.length).toBe(50)
+    expect(one.entries[0]!.title).toBe('Room 55')
+    expect(one.next).toBe(one.entries[49]!.id)
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.list', after: one.next! })
+    const two = await sam.session('lib.page', from)
+    expect(two.entries.map((e) => e.title)).toEqual([
+      'Room 5',
+      'Room 4',
+      'Ring 3',
+      'Room 2',
+      'Room 1',
+      'Ring 0',
+    ])
+    expect(two.next).toBeUndefined()
+  })
+
+  it('keeps publishing to authors, versions to their own, and holds the rate', async () => {
+    const { sam, kiku, bo } = await authors()
+    bo.send({ sv: 1, t: 'lib.publish', code: scenarioCode('Mine') })
+    expect(await bo.session('refuse')).toMatchObject({ reason: 'forbidden' })
+    sam.send({ sv: 1, t: 'lib.publish', code: scenarioCode('Sam’s') })
+    const theirs = (await entryOf(sam)).entry
+    kiku.send({ sv: 1, t: 'lib.publish', entry: theirs.id, code: scenarioCode('Not Kiku’s') })
+    expect(await kiku.session('refuse')).toMatchObject({ reason: 'forbidden' })
+    // A piece can't be a scenario's next version.
+    let from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.publish', entry: theirs.id, code: pieceCode('A ring') })
+    expect(await sam.session('refuse', from)).toMatchObject({ reason: 'forbidden' })
+    // Ten an hour.
+    for (let n = 0; n < 9; n++) {
+      from = sam.got.length
+      sam.send({ sv: 1, t: 'lib.publish', code: scenarioCode(`More ${n}`) })
+      await entryOf(sam, from)
+    }
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.publish', code: scenarioCode('One too many') })
+    expect(await sam.session('refuse', from)).toMatchObject({ reason: 'slow' })
+  })
+
+  it('reads a code’s envelope only, and refuses one that doesn’t hold', async () => {
+    const { sam } = await authors()
+    const good = scenarioCode('Fine')
+    const bad = [
+      good.replace(/\.[0-9a-f]{8}\./, '.00000000.'),
+      `bdsc1.${'0'.repeat(8)}.${'A'.repeat(16_400)}`,
+      code('bdhb1', { kind: 'item', flavour: 'no name' }),
+      code('bdsc1', { intro: 'no title' }),
+      'bdsc1.00000000.!!',
+    ]
+    for (const c of bad) {
+      const from = sam.got.length
+      sam.send({ sv: 1, t: 'lib.publish', code: c })
+      expect(await sam.session('refuse', from)).toMatchObject({ reason: 'garbled' })
+    }
+    // A newer code version, with a field no build knows: taken, read as far as its listing.
+    let from = sam.got.length
+    sam.send({
+      sv: 1,
+      t: 'lib.publish',
+      code: code('bdsc7', { title: 'From the future', comets: [1, 2] }),
+    })
+    expect((await entryOf(sam, from)).entry).toMatchObject({ title: 'From the future', version: 1 })
+    from = sam.got.length
+    sam.send({ sv: 1, t: 'lib.publish', code: good })
+    expect((await entryOf(sam, from)).entry.title).toBe('Fine')
+  })
+
+  it('withdraws, takes reports on entries, survives a restart, and forgets a leaver’s', async () => {
+    const { s, data, sam, kiku, bo } = await authors()
+    kiku.send({ sv: 1, t: 'lib.publish', code: pieceCode('Frost Ring') })
+    const ring = (await entryOf(kiku)).entry
+    const before = kiku.got.length
+    kiku.send({ sv: 1, t: 'lib.publish', code: pieceCode('Ember Edge') })
+    const edge = (await entryOf(kiku, before)).entry
+    bo.send({ sv: 1, t: 'lib.withdraw', entry: ring.id })
+    expect(await bo.session('refuse')).toMatchObject({ reason: 'forbidden' })
+    bo.send({
+      sv: 1,
+      t: 'report',
+      entry: ring.id,
+      member: kiku ? ring.by : ring.by,
+      reason: 'offensive',
+    })
+    await bo.session('reported')
+    sam.send({ sv: 1, t: 'reports' })
+    expect((await sam.session('reports')).list[0]).toMatchObject({
+      entry: { id: ring.id, title: 'Frost Ring' },
+    })
+    // The host withdraws it; it's gone for everyone.
+    sam.send({ sv: 1, t: 'lib.withdraw', entry: ring.id })
+    expect(await sam.session('lib.gone')).toMatchObject({ entry: ring.id })
+    // A restart keeps the rest.
+    await s.close()
+    servers.splice(servers.indexOf(s), 1)
+    const { s: again } = await server(data)
+    const k2 = await hello(again.port, 2)
+    await k2.session('server')
+    k2.send({ sv: 1, t: 'lib.list' })
+    expect((await k2.session('lib.page')).entries.map((e) => e.id)).toEqual([edge.id])
+    // Kiku leaves, asking to be forgotten: their entries go too.
+    k2.send({ sv: 1, t: 'leave', forget: true })
+    await k2.next(() => (k2.closed ? true : undefined)).catch(() => true)
+    const s2 = await hello(again.port, 1)
+    await s2.session('server')
+    s2.send({ sv: 1, t: 'lib.list' })
+    expect((await s2.session('lib.page')).entries).toEqual([])
+  })
+})
+
 describe('the server stands alone', () => {
   it('imports only Node, ws, its own modules and the shared five', () => {
     const dir = new URL('.', import.meta.url)
@@ -529,6 +769,7 @@ describe('the server stands alone', () => {
     }
     expect(readdirSync(new URL('./shared/', dir)).sort()).toEqual([
       'codec.ts',
+      'library-wire.ts',
       'reader.ts',
       'relay-wire.ts',
       'relay.ts',

@@ -17,6 +17,7 @@ import {
   SERVER_PROTOCOL,
   SESSION_LIMITS,
   type SessionRefuse,
+  type LibraryListing,
   type TableListing,
   type ToServer,
   encodeInvite,
@@ -25,6 +26,9 @@ import {
 } from './shared/session-wire.ts'
 import {
   DataFolder,
+  LibraryFolder,
+  type StoredEntry,
+  type StoredVersion,
   type ServerFile,
   type StoredInvite,
   type StoredMember,
@@ -35,6 +39,7 @@ import {
   newSecret,
 } from './store.ts'
 import { type WebSocket, WebSocketServer } from 'ws'
+import { LIBRARY_LIMITS, type LibraryKind, readCodeListing } from './shared/library-wire.ts'
 
 /**
  * The reference server (docs/proposals/self-hosted-servers.md, slice SH1;
@@ -140,6 +145,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   const say = opts.log ?? (() => {})
   const rate = { ...LIMITS, ...opts.limits }
   const folder = new DataFolder(opts.data)
+  const library = new LibraryFolder(opts.data)
   const fresh = (): ServerFile => ({
     format: SERVER_FORMAT,
     version: SERVER_VERSION,
@@ -348,11 +354,37 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
           folder.update(fresh, (f) => {
             f.members = f.members.filter((x) => x.id !== member.id)
           })
+          // Their entries go with them.
+          const index = library.read()
+          for (const e of index.entries.filter((x) => x.by === member.id)) library.dropEntry(e.id)
+          index.entries = index.entries.filter((x) => x.by !== member.id)
+          library.write(index)
           say(`${member.name} left, and asked to be forgotten`)
         }
         conn.ws.close(1000, 'left')
         return
       }
+      case 'lib.list':
+        return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'lib.page', ...libraryPage(m) })
+      case 'lib.get': {
+        const entry = library.read().entries.find((e) => e.id === m.entry)
+        const v = entry?.versions.find((x) => x.v === (m.version ?? entry.versions.at(-1)!.v))
+        const code =
+          entry === undefined || v === undefined ? undefined : library.code(entry.id, v.v)
+        if (code === undefined)
+          return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'lib.gone', entry: m.entry })
+        return sendSession(conn, {
+          sv: SERVER_PROTOCOL,
+          t: 'lib.code',
+          entry: m.entry,
+          version: v!.v,
+          code,
+        })
+      }
+      case 'lib.publish':
+        return publish(conn, member, m)
+      case 'lib.withdraw':
+        return withdraw(conn, member, m)
       case 'report': {
         folder.update(fresh, (f) => {
           f.reports.push({
@@ -362,6 +394,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
             at: now(),
             ...(m.member === undefined ? {} : { member: m.member }),
             ...(m.room === undefined ? {} : { room: m.room }),
+            ...(m.entry === undefined ? {} : { entry: m.entry }),
           })
           if (f.reports.length > LIMITS.reports) f.reports.shift()
         })
@@ -511,6 +544,144 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
     }
   }
 
+  // The library (docs/proposals/self-hosted-servers.md, section 3; slice SH3).
+
+  /** An entry's newest title, or what's said of one withdrawn. */
+  function titleOf(id: string): string {
+    return (
+      library
+        .read()
+        .entries.find((e) => e.id === id)
+        ?.versions.at(-1)?.title ?? 'withdrawn'
+    )
+  }
+
+  /** An entry as a page lists it: its newest version's listing. */
+  function listed(e: StoredEntry): LibraryListing {
+    const v = e.versions.at(-1)!
+    return {
+      id: e.id,
+      kind: e.kind,
+      sort: v.sort,
+      title: v.title,
+      intro: v.intro,
+      author: v.author,
+      by: e.by,
+      byName: nameOf(e.by),
+      version: v.v,
+      versions: e.versions.length,
+      at: v.at,
+      ...(v.cols === undefined ? {} : { cols: v.cols }),
+      ...(v.rows === undefined ? {} : { rows: v.rows }),
+      ...(v.seats === undefined ? {} : { seats: v.seats }),
+    }
+  }
+
+  /** A page of entries: newest first, of a kind, by a member, a title search, after an entry. */
+  function libraryPage(m: { kind?: LibraryKind; q?: string; by?: string; after?: string }): {
+    entries: LibraryListing[]
+    next?: string
+  } {
+    const q = m.q?.toLowerCase()
+    const all = library
+      .read()
+      .entries.filter(
+        (e) =>
+          (m.kind === undefined || e.kind === m.kind) &&
+          (m.by === undefined || e.by === m.by) &&
+          (q === undefined || e.versions.at(-1)!.title.toLowerCase().includes(q)),
+      )
+      .sort((a, b) => b.versions.at(-1)!.at - a.versions.at(-1)!.at || (a.id < b.id ? -1 : 1))
+    const from = m.after === undefined ? 0 : all.findIndex((e) => e.id === m.after) + 1
+    const page = all.slice(from, from + LIBRARY_LIMITS.page)
+    const more = from + LIBRARY_LIMITS.page < all.length
+    return { entries: page.map(listed), ...(more ? { next: page.at(-1)!.id } : {}) }
+  }
+
+  /** A member's publishing, the last hour's: at most `LIBRARY_LIMITS.perHour`. */
+  const publishing = new Map<string, number[]>()
+
+  function publish(conn: Connection, member: StoredMember, m: { code: string; entry?: string }) {
+    const me = file().members.find((x) => x.id === member.id)
+    // Members browse and keep; authors, moderators and owners publish (section 5, "Roles").
+    if (me === undefined || me.role === 'member') return refuseSession(conn, 'forbidden')
+    const read = readCodeListing(m.code)
+    if (!('ok' in read)) return refuseSession(conn, 'garbled')
+    const listing = read.ok
+    const t = now()
+    const recent = (publishing.get(me.id) ?? []).filter((at) => at > t - 3_600_000)
+    const index = library.read()
+    const same = m.entry === undefined ? undefined : index.entries.find((e) => e.id === m.entry)
+    if (
+      m.entry !== undefined &&
+      (same === undefined || same.by !== me.id || same.kind !== listing.kind)
+    ) {
+      return refuseSession(conn, 'forbidden')
+    }
+    const version: StoredVersion = {
+      v: (same?.versions.at(-1)?.v ?? 0) + 1,
+      at: t,
+      content: listing.content,
+      title: listing.title,
+      intro: listing.intro,
+      author: listing.author,
+      sort: listing.sort,
+      ...(listing.cols === undefined ? {} : { cols: listing.cols }),
+      ...(listing.rows === undefined ? {} : { rows: listing.rows }),
+      ...(listing.seats === undefined ? {} : { seats: listing.seats }),
+    }
+    // The same code again is the same version: nothing new.
+    if (same !== undefined && same.versions.at(-1)!.content === listing.content) {
+      return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'lib.entry', entry: listed(same) })
+    }
+    if (recent.length >= LIBRARY_LIMITS.perHour) return refuseSession(conn, 'slow')
+    let entry = same
+    if (entry === undefined) {
+      if (index.entries.length >= LIBRARY_LIMITS.entries) return refuseSession(conn, 'full')
+      if (index.entries.filter((e) => e.by === me.id).length >= LIBRARY_LIMITS.mine) {
+        return refuseSession(conn, 'full')
+      }
+      let id = newCode(8)
+      while (index.entries.some((e) => e.id === id)) id = newCode(8)
+      entry = { id, kind: listing.kind, by: me.id, versions: [] }
+      index.entries.push(entry)
+    }
+    library.putCode(entry.id, version.v, m.code)
+    entry.versions.push(version)
+    while (entry.versions.length > LIBRARY_LIMITS.versions) {
+      library.dropVersion(entry.id, entry.versions.shift()!.v)
+    }
+    library.write(index)
+    publishing.set(me.id, [...recent, t])
+    say(`${me.name} published ${listing.kind} "${listing.title}" (version ${version.v})`)
+    sendSession(conn, { sv: SERVER_PROTOCOL, t: 'lib.entry', entry: listed(entry) })
+  }
+
+  function withdraw(
+    conn: Connection,
+    member: StoredMember,
+    m: { entry: string; version?: number },
+  ) {
+    const me = file().members.find((x) => x.id === member.id)
+    const index = library.read()
+    const entry = index.entries.find((e) => e.id === m.entry)
+    if (entry === undefined)
+      return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'lib.gone', entry: m.entry })
+    const host = me !== undefined && (me.role === 'owner' || me.role === 'moderator')
+    if (me === undefined || (entry.by !== me.id && !host)) return refuseSession(conn, 'forbidden')
+    if (m.version !== undefined && entry.versions.length > 1) {
+      entry.versions = entry.versions.filter((v) => v.v !== m.version)
+      library.dropVersion(entry.id, m.version)
+      library.write(index)
+      return sendSession(conn, { sv: SERVER_PROTOCOL, t: 'lib.entry', entry: listed(entry) })
+    }
+    index.entries = index.entries.filter((e) => e !== entry)
+    library.dropEntry(entry.id)
+    library.write(index)
+    say(`${me.name} withdrew "${entry.versions.at(-1)?.title ?? '?'}"`)
+    sendSession(conn, { sv: SERVER_PROTOCOL, t: 'lib.gone', entry: entry.id })
+  }
+
   function nameOf(id: string): string {
     return file().members.find((x) => x.id === id)?.name ?? 'someone gone'
   }
@@ -553,6 +724,7 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
         at: x.at,
         ...(x.member === undefined ? {} : { member: { id: x.member, name: nameOf(x.member) } }),
         ...(x.room === undefined ? {} : { room: x.room }),
+        ...(x.entry === undefined ? {} : { entry: { id: x.entry, title: titleOf(x.entry) } }),
       }))
     sendSession(conn, { sv: SERVER_PROTOCOL, t: 'reports', list })
   }

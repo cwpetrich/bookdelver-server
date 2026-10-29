@@ -1,0 +1,26 @@
+# Render: a Blueprint for the Bookdelver server from its published image,
+# HTTPS on <your-service>.onrender.com. A template: this repository creates
+# nothing on Render. In Render's dashboard: New > Blueprint, this repository.
+# Then set BOOKDELVER_URL to wss://<your-service>.onrender.com, and read the
+# owner invite in the service's logs.
+#
+# A disk needs a paid instance type: Render's free one sleeps, and loses its
+# files, so a server there forgets its members.
+services:
+  - type: web
+    name: bookdelver-server
+    runtime: image
+    image:
+      url: ghcr.io/cwpetrich/bookdelver-server:latest
+    plan: starter
+    envVars:
+      - key: BOOKDELVER_URL
+        value: wss://bookdelver-server.onrender.com
+      - key: BOOKDELVER_DATA
+        value: /data
+      - key: BOOKDELVER_PORT
+        value: '8787'
+    disk:
+      name: bookdelver-data
+      mountPath: /data
+      sizeGB: 1

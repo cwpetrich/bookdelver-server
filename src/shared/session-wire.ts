@@ -5,6 +5,7 @@
 // in that repository holds this copy to it, byte for byte below this header.
 
 import { crc32, crcHex, fromBase64Url, toBase64Url, utf8Decode, utf8Encode } from './codec.ts'
+import { LIBRARY_LIMITS, type LibraryKind } from './library-wire.ts'
 import { Reader, Stop } from './reader.ts'
 
 /**
@@ -96,6 +97,32 @@ export interface MemberListing extends Member {
   banned: boolean
 }
 
+/** An entry in a server's library (SH3), as its pages list it: its listing, never its code. */
+export interface LibraryListing {
+  /** The entry's id: the server's, 8 characters of the share codes' alphabet. */
+  id: string
+  kind: LibraryKind
+  /** A piece's kind (`item`, `feat`, …), or `scenario`. */
+  sort: string
+  title: string
+  /** A scenario's intro, a piece's flavour; maybe empty. */
+  intro: string
+  /** Its author as the code names them; maybe empty. */
+  author: string
+  /** Who published it here: their member id and name. */
+  by: string
+  byName: string
+  /** Its newest version, and how many are kept. */
+  version: number
+  versions: number
+  /** When its newest version came (ms since 1970). */
+  at: number
+  /** A scenario's board and seats. */
+  cols?: number
+  rows?: number
+  seats?: number
+}
+
 /** Why a member reports another or a table (section 5): a closed list, no free text. */
 export type ReportReason = 'offensive' | 'cheating' | 'spam' | 'other'
 export const REPORT_REASONS: readonly ReportReason[] = ['offensive', 'cheating', 'spam', 'other']
@@ -107,6 +134,8 @@ export interface ReportListing {
   by: string
   /** The member reported, if a member was. */
   member?: { id: string; name: string }
+  /** The library's entry reported, if one was (SH3). */
+  entry?: { id: string; title: string }
   /** The table reported, if one was. */
   room?: string
   reason: ReportReason
@@ -169,7 +198,16 @@ export type ToServer = { sv: typeof SERVER_PROTOCOL } & (
   /** Leaving the server: `forget`, its record and its entries deleted. */
   | { t: 'leave'; forget: boolean }
   /** A member reports another, or a table: to the host's inbox. */
-  | { t: 'report'; reason: ReportReason; member?: string; room?: string }
+  | { t: 'report'; reason: ReportReason; member?: string; room?: string; entry?: string }
+  // The library (SH3).
+  /** A page of entries, newest first: of a kind, a title search, by a member, after an entry. */
+  | { t: 'lib.list'; kind?: LibraryKind; q?: string; by?: string; after?: string }
+  /** An entry's code: its newest version, or the one asked for. */
+  | { t: 'lib.get'; entry: string; version?: number }
+  /** A code published: a new entry, or a new version of the member's own. */
+  | { t: 'lib.publish'; code: string; entry?: string }
+  /** An entry withdrawn (the member's own; any, for owners and moderators), or one version of it. */
+  | { t: 'lib.withdraw'; entry: string; version?: number }
   // The host's tools (SH2): owners and moderators.
   /** A new invite: its role, its uses, and how many hours it lasts (none: until used). */
   | { t: 'invite'; role: MemberRole; uses: number; hours?: number }
@@ -211,6 +249,12 @@ export type FromServer = { sv: typeof SERVER_PROTOCOL } & (
   | { t: 'invites'; list: InviteListing[] }
   | { t: 'members'; list: MemberListing[] }
   | { t: 'reports'; list: ReportListing[] }
+  | { t: 'lib.page'; entries: LibraryListing[]; next?: string }
+  | { t: 'lib.code'; entry: string; version: number; code: string }
+  /** An entry published, or changed. */
+  | { t: 'lib.entry'; entry: LibraryListing }
+  /** An entry withdrawn, whole. */
+  | { t: 'lib.gone'; entry: string }
 )
 
 export type SessionResult<T> = { ok: T } | { problems: string[] }
@@ -218,6 +262,11 @@ export type SessionResult<T> = { ok: T } | { problems: string[] }
 const ID = /^[0-9A-HJKMNP-TV-Z]{8}$/
 const SECRET = /^[A-Za-z0-9_-]{43}$/
 const ROOM = /^[0-9A-HJKMNP-TV-Z]{6}$/
+/** A scenario's or a homebrew piece's code, as far as its shape: the library reads the rest. */
+const CODE = new RegExp(
+  `^(bdsc|bdhb)\\d{1,4}\\.[0-9a-f]{8}\\.[A-Za-z0-9_-]{1,${LIBRARY_LIMITS.pieceCode}}$`,
+)
+const KINDS: readonly LibraryKind[] = ['scenario', 'piece']
 
 class SessionReader extends Reader {
   shape(value: unknown, where: string, allowed: readonly string[], required = allowed) {
@@ -256,6 +305,85 @@ class SessionReader extends Reader {
   /** Text that may be empty (a notice), else as `text` reads it. */
   maybeEmpty(value: unknown, where: string, max: number): string | undefined {
     return value === '' ? '' : this.text(value, where, max, true)
+  }
+
+  /** A library entry's listing, as the server sent it. */
+  listing(value: unknown, where: string): LibraryListing | undefined {
+    const keys = [
+      'id',
+      'kind',
+      'sort',
+      'title',
+      'intro',
+      'author',
+      'by',
+      'byName',
+      'version',
+      'versions',
+      'at',
+    ]
+    const o = this.shape(value, where, [...keys, 'cols', 'rows', 'seats'], keys)
+    if (o === undefined) return undefined
+    const id = this.match(this.field(o, 'id'), `${where}.id`, ID, 'an entry’s id')
+    const kind = this.oneOf(this.field(o, 'kind'), `${where}.kind`, KINDS)
+    const sort = this.match(this.field(o, 'sort'), `${where}.sort`, /^[a-z-]{1,20}$/, 'a kind')
+    const title = this.text(this.field(o, 'title'), `${where}.title`, LIBRARY_LIMITS.title)
+    const intro = this.maybeEmpty(this.field(o, 'intro'), `${where}.intro`, LIBRARY_LIMITS.intro)
+    const author = this.maybeEmpty(
+      this.field(o, 'author'),
+      `${where}.author`,
+      LIBRARY_LIMITS.author,
+    )
+    const by = this.match(this.field(o, 'by'), `${where}.by`, ID, 'a member’s id')
+    const byName = this.text(this.field(o, 'byName'), `${where}.byName`, SESSION_LIMITS.name)
+    const version = this.whole(this.field(o, 'version'), `${where}.version`, {
+      min: 1,
+      max: 1_000_000,
+    })
+    const versions = this.whole(this.field(o, 'versions'), `${where}.versions`, {
+      min: 1,
+      max: LIBRARY_LIMITS.versions,
+    })
+    const at = this.time(this.field(o, 'at'), `${where}.at`)
+    const dim = (k: string, max: number) =>
+      this.field(o, k) === undefined
+        ? undefined
+        : this.whole(this.field(o, k), `${where}.${k}`, { min: 1, max })
+    const cols = dim('cols', 99)
+    const rows = dim('rows', 99)
+    const seats = dim('seats', 9)
+    if (
+      id === undefined ||
+      kind === undefined ||
+      sort === undefined ||
+      title === undefined ||
+      intro === undefined ||
+      author === undefined ||
+      by === undefined ||
+      byName === undefined ||
+      version === undefined ||
+      versions === undefined ||
+      at === undefined ||
+      this.problems.length > 0
+    ) {
+      return undefined
+    }
+    return {
+      id,
+      kind,
+      sort,
+      title,
+      intro,
+      author,
+      by,
+      byName,
+      version,
+      versions,
+      at,
+      ...(cols === undefined ? {} : { cols }),
+      ...(rows === undefined ? {} : { rows }),
+      ...(seats === undefined ? {} : { seats }),
+    }
   }
 
   member(value: unknown, where: string): Member | undefined {
@@ -323,11 +451,65 @@ export function readToServer(value: unknown): SessionResult<ToServer> {
       'settings',
       'reports',
       'dismiss',
+      'lib.list',
+      'lib.get',
+      'lib.publish',
+      'lib.withdraw',
     ] as const)
     const sv = SERVER_PROTOCOL
     switch (t) {
       case undefined:
         return undefined
+      case 'lib.list': {
+        const o = r.shape(raw, '', ['sv', 't', 'kind', 'q', 'by', 'after'], ['sv', 't'])
+        if (o === undefined) return undefined
+        const kind =
+          r.field(o, 'kind') === undefined ? undefined : r.oneOf(r.field(o, 'kind'), 'kind', KINDS)
+        const q =
+          r.field(o, 'q') === undefined
+            ? undefined
+            : r.text(r.field(o, 'q'), 'q', LIBRARY_LIMITS.query)
+        const by =
+          r.field(o, 'by') === undefined
+            ? undefined
+            : r.match(r.field(o, 'by'), 'by', ID, 'a member’s id')
+        const after =
+          r.field(o, 'after') === undefined
+            ? undefined
+            : r.match(r.field(o, 'after'), 'after', ID, 'an entry’s id')
+        if (r.problems.length > 0) return undefined
+        return {
+          sv,
+          t,
+          ...(kind === undefined ? {} : { kind }),
+          ...(q === undefined ? {} : { q }),
+          ...(by === undefined ? {} : { by }),
+          ...(after === undefined ? {} : { after }),
+        }
+      }
+      case 'lib.get':
+      case 'lib.withdraw': {
+        const o = r.shape(raw, '', ['sv', 't', 'entry', 'version'], ['sv', 't', 'entry'])
+        if (o === undefined) return undefined
+        const entry = r.match(r.field(o, 'entry'), 'entry', ID, 'an entry’s id')
+        const version =
+          r.field(o, 'version') === undefined
+            ? undefined
+            : r.whole(r.field(o, 'version'), 'version', { min: 1, max: 1_000_000 })
+        if (entry === undefined || r.problems.length > 0) return undefined
+        return { sv, t, entry, ...(version === undefined ? {} : { version }) }
+      }
+      case 'lib.publish': {
+        const o = r.shape(raw, '', ['sv', 't', 'code', 'entry'], ['sv', 't', 'code'])
+        if (o === undefined) return undefined
+        const code = r.match(r.field(o, 'code'), 'code', CODE, 'a scenario’s or a piece’s code')
+        const entry =
+          r.field(o, 'entry') === undefined
+            ? undefined
+            : r.match(r.field(o, 'entry'), 'entry', ID, 'an entry’s id')
+        if (code === undefined || r.problems.length > 0) return undefined
+        return { sv, t, code, ...(entry === undefined ? {} : { entry }) }
+      }
       case 'hello': {
         const keys = ['sv', 't', 'build', 'secret', 'invite', 'name']
         const o = r.shape(raw, '', keys, ['sv', 't', 'build', 'secret'])
@@ -366,7 +548,12 @@ export function readToServer(value: unknown): SessionResult<ToServer> {
         return forget === undefined ? undefined : { sv, t, forget }
       }
       case 'report': {
-        const o = r.shape(raw, '', ['sv', 't', 'reason', 'member', 'room'], ['sv', 't', 'reason'])
+        const o = r.shape(
+          raw,
+          '',
+          ['sv', 't', 'reason', 'member', 'room', 'entry'],
+          ['sv', 't', 'reason'],
+        )
         if (o === undefined) return undefined
         const reason = r.oneOf(r.field(o, 'reason'), 'reason', REPORT_REASONS)
         const member =
@@ -377,9 +564,13 @@ export function readToServer(value: unknown): SessionResult<ToServer> {
           r.field(o, 'room') === undefined
             ? undefined
             : r.match(r.field(o, 'room'), 'room', ROOM, 'a room code')
+        const entry =
+          r.field(o, 'entry') === undefined
+            ? undefined
+            : r.match(r.field(o, 'entry'), 'entry', ID, 'an entry’s id')
         if (reason === undefined || r.problems.length > 0) return undefined
-        if (member === undefined && room === undefined) {
-          r.problem('', 'should name a member or a table')
+        if (member === undefined && room === undefined && entry === undefined) {
+          r.problem('', 'should name a member, a table or an entry')
           return undefined
         }
         return {
@@ -388,6 +579,7 @@ export function readToServer(value: unknown): SessionResult<ToServer> {
           reason,
           ...(member === undefined ? {} : { member }),
           ...(room === undefined ? {} : { room }),
+          ...(entry === undefined ? {} : { entry }),
         }
       }
       case 'invite': {
@@ -493,6 +685,10 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
       'invites',
       'members',
       'reports',
+      'lib.page',
+      'lib.code',
+      'lib.entry',
+      'lib.gone',
     ] as const)
     const sv = SERVER_PROTOCOL
     switch (t) {
@@ -572,6 +768,44 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
       }
       case 'reported':
         return r.shape(raw, '', ['sv', 't']) === undefined ? undefined : { sv, t }
+      case 'lib.page': {
+        const o = r.shape(raw, '', ['sv', 't', 'entries', 'next'], ['sv', 't', 'entries'])
+        if (o === undefined) return undefined
+        const list = r.list(r.field(o, 'entries'), 'entries', LIBRARY_LIMITS.page)
+        if (list === undefined) return undefined
+        const entries: LibraryListing[] = []
+        for (let i = 0; i < list.length; i++) {
+          const e = r.listing(list[i], `entries[${i}]`)
+          if (e === undefined) return undefined
+          entries.push(e)
+        }
+        const next =
+          r.field(o, 'next') === undefined
+            ? undefined
+            : r.match(r.field(o, 'next'), 'next', ID, 'an entry’s id')
+        if (r.problems.length > 0) return undefined
+        return { sv, t, entries, ...(next === undefined ? {} : { next }) }
+      }
+      case 'lib.code': {
+        const o = r.shape(raw, '', ['sv', 't', 'entry', 'version', 'code'])
+        if (o === undefined) return undefined
+        const entry = r.match(r.field(o, 'entry'), 'entry', ID, 'an entry’s id')
+        const version = r.whole(r.field(o, 'version'), 'version', { min: 1, max: 1_000_000 })
+        const code = r.match(r.field(o, 'code'), 'code', CODE, 'a scenario’s or a piece’s code')
+        return entry === undefined || version === undefined || code === undefined
+          ? undefined
+          : { sv, t, entry, version, code }
+      }
+      case 'lib.entry': {
+        const o = r.shape(raw, '', ['sv', 't', 'entry'])
+        const entry = o && r.listing(r.field(o, 'entry'), 'entry')
+        return entry === undefined ? undefined : { sv, t, entry }
+      }
+      case 'lib.gone': {
+        const o = r.shape(raw, '', ['sv', 't', 'entry'])
+        const entry = o && r.match(r.field(o, 'entry'), 'entry', ID, 'an entry’s id')
+        return entry === undefined ? undefined : { sv, t, entry }
+      }
       case 'invite': {
         const keys = ['sv', 't', 'id', 'secret', 'role', 'uses', 'expires']
         const o = r.shape(raw, '', keys, keys.slice(0, -1))
@@ -661,7 +895,7 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
           const e = r.shape(
             list[i],
             w,
-            ['id', 'by', 'member', 'room', 'reason', 'at'],
+            ['id', 'by', 'member', 'room', 'entry', 'reason', 'at'],
             ['id', 'by', 'reason', 'at'],
           )
           if (e === undefined) return undefined
@@ -675,6 +909,14 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
             const mid = mo && r.match(r.field(mo, 'id'), `${w}.member.id`, ID, 'a member’s id')
             const mname = mo && r.text(r.field(mo, 'name'), `${w}.member.name`, SESSION_LIMITS.name)
             if (mid !== undefined && mname !== undefined) member = { id: mid, name: mname }
+          }
+          let entry: { id: string; title: string } | undefined
+          if (r.field(e, 'entry') !== undefined) {
+            const eo = r.shape(r.field(e, 'entry'), `${w}.entry`, ['id', 'title'])
+            const eid = eo && r.match(r.field(eo, 'id'), `${w}.entry.id`, ID, 'an entry’s id')
+            const etitle =
+              eo && r.text(r.field(eo, 'title'), `${w}.entry.title`, LIBRARY_LIMITS.title)
+            if (eid !== undefined && etitle !== undefined) entry = { id: eid, title: etitle }
           }
           const room =
             r.field(e, 'room') === undefined
@@ -696,6 +938,7 @@ export function readFromServer(value: unknown): SessionResult<FromServer> {
             at,
             ...(member === undefined ? {} : { member }),
             ...(room === undefined ? {} : { room }),
+            ...(entry === undefined ? {} : { entry }),
           })
         }
         return { sv, t, list: out }

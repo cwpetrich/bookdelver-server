@@ -113,6 +113,40 @@ expires?, by? }`, members `{ id, name, role, joined, banned }`, and
   reports `{ id, by, member?: { id, name }, room?, reason, at }`. Times are
   in milliseconds since 1970.
 
+### The library (session 1, SH3)
+
+| A phone sends                         | The server answers                                 | Who may                                             |
+| ------------------------------------- | -------------------------------------------------- | --------------------------------------------------- |
+| `lib.list { kind?, q?, by?, after? }` | `lib.page { entries, next? }`                      | any member                                          |
+| `lib.get { entry, version? }`         | `lib.code { entry, version, code }`, or `lib.gone` | any member                                          |
+| `lib.publish { code, entry? }`        | `lib.entry { entry }`                              | authors, moderators, owners; a version to one's own |
+| `lib.withdraw { entry, version? }`    | `lib.gone { entry }`, or `lib.entry`               | its publisher; owners and moderators, any           |
+
+- **A code** is a scenario's (`bdsc…`) or a homebrew piece's (`bdhb…`). The
+  server reads its envelope only (`readCodeListing`):
+  - the prefix and the CRC-32;
+  - base64url that decodes, under the caps: a scenario's code 16,384
+    characters and its JSON 65,536 bytes, a piece's 24,000 and 16,384;
+  - JSON that parses;
+  - the listing's fields, read tolerantly as capped text: a scenario's
+    `title`, `intro`, `author`, board size and seats; a piece's `name`,
+    `flavour`, `author` and kind.
+
+  A code with no title is refused (`garbled`). It never runs the full
+  reader, so a newer build's code is taken. The listing never names a
+  scenario's monsters, nor their count. **Every phone reads a code it gets
+  strictly**, with the readers a pasted code goes through.
+
+- **Versions**: publishing a new code over one's own entry makes the next
+  version, and the same code again is the same version. The last 10 are
+  kept, and `lib.get` takes any of them.
+- **Caps**: 500 entries a server, 50 a member, 10 published an hour (`slow`),
+  50 a page, newest first. `next` is the last entry's id, sent back as
+  `after`.
+- **`report { entry }`** sends an entry to the host's inbox. A report then
+  lists `entry: { id, title }`.
+- **`leave { forget: true }`** deletes the member's entries too.
+
 ## The table layer: lockstep `v` 2
 
 These are DM9's lockstep messages (`docs/proposals/dm-scenarios.md`, "DM9

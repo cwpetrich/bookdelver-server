@@ -8,8 +8,9 @@ own phone. The server only puts everyone's choices in order and passes them
 on. It never runs a fight itself, so a $5 VPS, a home PC or a Raspberry Pi
 is plenty.
 
-- **Tables only, for now.** Players open tables and others join them. A
-  library of scenarios and the host's tools in the app come later.
+- **Tables and a library.** Players open tables and others join them. They
+  publish scenarios and homebrew pieces to the server's library, browse
+  them, and keep them. The host's tools are in the app.
 - **Sealed, like homebrew.** Nothing played on a server reaches anyone's
   library, Records or rankings.
 - **Plain files.** Everything lives in one folder (`--data`). A backup is a
@@ -79,6 +80,8 @@ The data folder holds two kinds of file:
   is kept only as its SHA-256.
 - `rooms/<code>.jsonl`: each open table's log. A table is deleted after 24
   hours with nothing happening.
+- `library/index.json` and `library/<entry>/<version>.txt`: the scenario
+  library. Each entry keeps its last 10 versions, one code a file.
 
 ### Trying it on one machine
 
@@ -116,20 +119,66 @@ tables.example.net {
 ### A home PC or Pi: a tunnel
 
 - **Cloudflare Tunnel** (`cloudflared`, free) puts a public name on your own
-  domain. Make a tunnel in Cloudflare's dashboard and route its name to
-  `http://localhost:8787` (or to `http://bookdelver:8787` from
-  `compose.yaml`'s commented `cloudflared` service). Start the server with
-  `--url wss://<that name>`.
+  domain:
+
+  ```
+  cloudflared tunnel login
+  cloudflared tunnel create bookdelver
+  cloudflared tunnel route dns bookdelver tables.example.net
+  cloudflared tunnel run --url http://localhost:8787 bookdelver
+  ```
+
+  Start the server with `--url wss://tables.example.net`. With Docker, use
+  `compose.yaml`'s commented `cloudflared` service and a tunnel token from
+  Cloudflare's dashboard instead.
+
 - **Tailscale Funnel** (free personal plan) gives you
   `https://<machine>.<tailnet>.ts.net`, with no domain needed. Run
-  `tailscale funnel 8787` on the machine, then start the server with
-  `--url wss://<machine>.<tailnet>.ts.net`. `compose.yaml` has a commented
-  service for it too.
+  `tailscale funnel --bg 8787` on the machine, then start the server with
+  `--url wss://<machine>.<tailnet>.ts.net`. With Docker, use
+  `compose.yaml`'s commented `tailscale` service; its `tailscale/serve.json`
+  turns the funnel on.
+
+Then check it with `doctor` (below).
 
 ### A one-click host
 
-Hosts like Fly.io, Render and Railway give you a name with HTTPS
-(`<app>.fly.dev`). Templates for them come later.
+These hosts run the published image and give it an HTTPS name, with no
+machine to look after. Each template is a file in this repository; you make
+the app with your own account there.
+
+- **Fly.io** (`fly.toml`): `fly launch --copy-config --no-deploy`, then
+  `fly volumes create bookdelver_data --size 1`, then `fly deploy`. Set
+  `BOOKDELVER_URL` to `wss://<your-app>.fly.dev`, and read the owner invite
+  with `fly logs`. One small machine, always on, with a 1 GB volume.
+- **Render** (`render.yaml`): New > Blueprint, pointed at this repository.
+  Set `BOOKDELVER_URL` to `wss://<your-service>.onrender.com`. A disk needs
+  a paid instance type, because the free one sleeps and loses its files.
+- **Railway** (`railway.json`): New Project > Deploy from GitHub repo, then
+  add a volume mounted at `/data`. In its variables, set `BOOKDELVER_DATA=/data`
+  and `BOOKDELVER_URL=wss://<your-app>.up.railway.app`, and give it a public
+  domain on port 8787.
+
+Hosts change their plans and buttons, so check their own docs.
+
+### Check it: `doctor`
+
+From any machine, check what your invites carry:
+
+```
+npx bookdelver-server doctor --url wss://tables.example.net
+```
+
+It checks four things, in order, and stops at the first that fails:
+
+1. The address is one the app connects to.
+2. Its name resolves.
+3. Its certificate is valid for that name.
+4. A WebSocket opens there, and a Bookdelver server answers `hello`.
+
+Its hello carries no name, so the server keeps nothing. In the app,
+**Test this address** (Homebrew > Servers > Add by address) does the same
+from a phone.
 
 **Not recommended:**
 

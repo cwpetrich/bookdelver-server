@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import type { JoinPolicy, MemberRole } from './shared/session-wire.ts'
+import { doctor, doctorLines } from './doctor.ts'
 import { startServer } from './server.ts'
 
 /**
@@ -44,6 +45,18 @@ if (values.help === true) {
 }
 
 const command = positionals[0] ?? 'serve'
+
+// `doctor`: the setup checked from this machine, against the address invites carry: nothing else.
+if (command === 'doctor') {
+  const url = pick(values.url, 'URL')
+  if (url === undefined) {
+    console.error('doctor needs the address invites carry: --url wss://…')
+    process.exit(2)
+  }
+  const checks = await doctor(url)
+  for (const line of doctorLines(checks)) console.log(line)
+  process.exit(checks.every((c) => c.ok) ? 0 : 1)
+}
 const data = resolve(pick(values.data, 'DATA') ?? './bookdelver-data')
 const join = pick(values.join, 'JOIN') ?? 'invite'
 if (join !== 'invite' && join !== 'open') {
@@ -85,7 +98,7 @@ if (command === 'invite') {
 }
 
 if (command !== 'serve') {
-  console.error(`Unknown command: ${command} (serve, invite)`)
+  console.error(`Unknown command: ${command} (serve, invite, doctor)`)
   process.exit(2)
 }
 
